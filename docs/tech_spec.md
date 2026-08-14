@@ -1,9 +1,9 @@
 # process_exporter — Technical Specification
 
-**Version:** 1.0 (design)
+**Version:** 1.0 (as implemented)
 **Binary:** `process_exporter`
 **Language:** Go 1.22
-**Target:** Linux only
+**Platform:** Linux only
 
 ---
 
@@ -16,102 +16,133 @@ A Prometheus exporter that reads `/proc` on a fixed interval, groups every runni
 It answers questions of this form:
 
 - How much resident memory is `nginx` using on this box, in total across all its workers?
-- Is the `postgres` process group approaching its file descriptor limit?
-- Which process group's CPU consumption grew after last night's deploy?
-- How many `python3` processes is the `deploy` user running, and how many is `root` running?
+- Is the `postgres` group approaching its file descriptor limit?
+- Which group's CPU consumption grew after last night's deploy?
+- How many `python3` processes does `deploy` run, and how many does `root` run?
 
 ## 1.2 The unit of measurement
 
 The unit is the **process group**, not the process. A group is every process sharing a name and an owning user. Forty `nginx` workers owned by `www-data` produce one series per metric, carrying the sum across all forty, plus a count of how many there were.
 
-Individual processes are never visible in the output. They are read, aggregated, and discarded within one scan. **No PID appears anywhere in any label.**
+Individual processes are read, aggregated, and discarded within one scan. **No PID appears anywhere in any label.**
+
+Live output from a running instance:
+
+```
+process_group_cpu_seconds_total{mode="user",name="python/app",user="geoff"} 0.42
+process_group_cpu_seconds_total{mode="system",name="python/app",user="geoff"} 0.09
+process_group_memory_rss_bytes{name="python/app",user="geoff"} 44036096
+process_group_num_procs{name="python/app",user="geoff"} 3
+```
+
+Note `python/app`: the naming rules extracted the script name from the command line, because `comm` for that process is `python3` and grouping on `comm` alone would merge every Python service on the machine into one bucket.
 
 ## 1.3 Two constraints that shape everything
 
 ### Constraint 1: bounded cardinality
 
-A Prometheus time series is identified by its label set. If PID were a label, every process start would create a new series. A machine that forks a short-lived process every second creates 86,400 series per day, each living in memory until it ages out. The series count becomes unbounded and driven by workload behaviour rather than by anything the operator chose.
+A Prometheus time series is identified by its label set. If PID were a label, every process start would create a new series. A machine forking a short-lived process every second creates 86,400 series per day, each living in memory until it ages out. The series count becomes unbounded and driven by workload behaviour rather than by anything the operator chose.
 
-The process name is bounded. A machine runs some finite set of programs. That set changes when software is installed, not when a program runs. Keying on name makes the series count a property of the machine's software inventory, which is stable and small.
+The process name is bounded. A machine runs some finite set of programs, and that set changes when software is installed, not when a program runs. Keying on name makes the series count a property of the machine's software inventory.
 
-Adding the owning user multiplies this by a small, also-bounded factor, and it earns its keep: knowing that one `nginx` is owned by `root` and forty by `www-data` is the master-and-workers structure made visible.
+Adding the owning user multiplies this by a small, also-bounded factor, and it earns its keep: one `nginx` owned by `root` and forty owned by `www-data` is the master-and-workers structure made visible.
 
 ### Constraint 2: negligible CPU cost
 
 The exporter competes for the resource it measures. A scan that reads two thousand `/proc` entries as fast as it can appears in `top` as a significant consumer, which is unacceptable for a monitoring agent.
 
-The exporter must not appear near the top of `top`. This is achieved by breaking the scan into batches with sleeps between them, by separating cheap reads from expensive ones and running them at different frequencies, and by running as a long-lived daemon so that no process startup cost is paid per scrape.
+The exporter must not appear near the top of `top`. This is achieved by breaking the scan into batches with sleeps between them, by separating cheap reads from expensive ones and running them at different frequencies, by caching values that cannot change, and by running as a long-lived daemon so no startup cost is paid per scrape.
+
+The exporter measures its own cost and publishes it as `process_exporter_scan_cpu_seconds_total`, so the constraint is verifiable rather than assumed.
 
 ---
 
 # Part 2 — Core mechanics
 
-Read this section before any other.
+Read this section before any other. Everything else follows from it.
 
 ## 2.1 Gauges are read; counters are accumulated
 
 `/proc` exposes two kinds of value, and they need completely different handling.
 
-**Gauges** are instantaneous. Resident memory is a page count right now. Open file descriptors is a directory entry count right now. Thread count is a number in `stat` right now. Read it, sum it across the group, publish it. One read is sufficient.
+**Gauges** are instantaneous. Resident memory is a page count right now. Open file descriptors is a directory entry count right now. Read it, sum it across the group, publish it. One read suffices.
 
-**Counters** are monotonic totals since process start. CPU is ticks consumed since the process began. Page faults, context switches, and I/O bytes are the same shape. A single read gives a lifetime total, which is not what anyone wants to see.
+**Counters** are monotonic totals since process start. CPU is ticks consumed since the process began; page faults, context switches, and I/O bytes have the same shape. A single read gives a lifetime total, which is not what anyone wants to see.
 
 ## 2.2 Why counters need per-PID state
 
-The useful value from a counter is the rate, which needs two reads separated by a known interval:
+The useful value from a counter is the rate, which requires two reads separated by a known interval:
 
 ```
-delta = ticks_now - ticks_previous
+delta = ticks_now − ticks_previous
 ```
 
-This requires the exporter to remember the previous value for each process. Three consequences follow, and they are the heart of the design:
+The exporter must therefore remember the previous value for each process. Three consequences follow:
 
 **State is per-PID, even though output is per-group.** A counter belongs to one process. Two processes named `nginx` have separate counters that both increase independently.
 
-**The delta must be computed per PID, then summed.** Summing the raw lifetime counters across a group and differencing the sum produces a wrong answer the moment one process exits: the sum drops discontinuously, and the difference goes negative. Per-PID first, sum second.
+**The delta must be computed per PID, then summed.** Summing raw lifetime counters across a group and differencing the sum produces a wrong answer the moment one member exits: the sum drops discontinuously and the difference goes negative. Per-PID first, sum second.
 
-**The first scan produces no counter deltas.** There is no previous reading. The first scan establishes the baseline; the second produces the first usable delta.
+**The first scan produces no counter deltas.** There is no previous reading. The first scan establishes the baseline; the second produces the first usable delta. This is why the sample output above shows zeros immediately after start.
 
 ## 2.3 Why the published counter is an accumulator
 
 A Prometheus counter must increase monotonically within a series. Prometheus treats any decrease as a counter reset and discards the interval.
 
-If the exporter published a group's CPU counter as the sum of its live members' lifetime totals, the value would drop every time a worker exited. Prometheus would see a reset. The data would be wrong.
+If the exporter published a group's CPU counter as the sum of its live members' lifetime totals, the value would drop every time a worker exited. Prometheus would see a reset and the data would be wrong.
 
-The correct construction is an **accumulator per group**. Each scan adds the sum of that group's per-PID deltas to the accumulator:
+The correct construction is an **accumulator per group**:
 
 ```
-accumulator[group] += Σ (ticks_now[pid] - ticks_prev[pid])   over pids in group
+accumulator[group] += Σ (ticks_now[pid] − ticks_prev[pid])   over pids in group
 ```
 
-The accumulator only ever increases, regardless of process churn. A process exiting simply stops contributing new deltas. The accumulator is what is published; the per-PID counters are internal working values that never leave the scan.
+The accumulator only ever increases, regardless of churn. A process exiting simply stops contributing new deltas. The accumulator is published; the per-PID counters are internal working values that never leave the scan.
 
 ## 2.4 PID reuse
 
-The kernel wraps PIDs. An old state entry can be matched against a new process holding the same number. The new process's counter starts near zero, so the delta computes as a large negative number.
+The kernel wraps PIDs. An old state entry can be matched against a new process holding the same number, whose counters start near zero, producing a large negative delta.
 
-The defence is the process start time. `/proc/<pid>/stat` field 22 gives the start time in clock ticks since boot. It is fixed for the life of a process and effectively unique in combination with the PID.
+The defence is the process start time. `/proc/<pid>/stat` field 22 gives the start time in clock ticks since boot; it is fixed for the life of a process and effectively unique in combination with the PID.
 
-Each state entry stores the start time. On each scan:
+Each state entry stores it. On lookup:
 
 - Start time matches → same process, compute the delta.
-- Start time differs → different process reusing the PID. Discard the old entry, treat this as a new process, produce no delta this scan.
+- Start time differs → PID reuse. The stale entry is deleted, the process is treated as new, and no delta is produced this scan.
 
-Additionally, any negative delta from any source is discarded rather than published. This is a second line of defence against a start-time read that failed.
+A second line of defence clamps every delta at zero, so a negative value from any source never reaches a counter.
 
 ## 2.5 State pruning
 
 The per-PID state map grows every time a new process appears. Without pruning it grows without bound.
 
-Each scan increments a **generation counter** and stamps every PID it observes with the current value. At the end of the scan, entries whose stamp is older than the current generation belong to processes that no longer exist and are deleted.
+Each scan increments a **generation counter** and stamps every PID it observes. At the end of the scan, entries whose stamp is older than the current generation belong to processes that no longer exist and are deleted.
 
-The map size therefore tracks the number of live processes, not the number that have ever existed. This is what makes the exporter safe to run for months without restart.
+The map size therefore tracks live processes, not historical ones. This is what makes the exporter safe to run for months without a restart. It is published as `process_exporter_state_entries`.
 
 ## 2.6 Group accumulator lifetime
 
-Group accumulators must not be pruned on the same schedule as PID state. A group whose processes all exit and then restart minutes later must resume its counter from where it left off, or Prometheus sees a reset.
+Accumulators must not be pruned on the same schedule as PID state. A group whose processes all exit and then restart minutes later must resume its counter where it left off, or Prometheus sees a reset.
 
-Accumulators are kept for `group_retention` (default 1h) after the group was last seen. During that window the group emits no gauge series — it has no live members — but its accumulator survives. Beyond the window the group is forgotten entirely, on the assumption that the program has been uninstalled or permanently stopped.
+Accumulators are kept for `group_retention` (default 1h) after the group was last seen. During that window the group emits no gauge series — it has no live members — but its accumulator survives. Beyond the window the group is forgotten, on the assumption that the program was uninstalled or permanently stopped.
+
+## 2.7 Caching what cannot change
+
+Several values are fixed for the life of a process:
+
+| Value | Source |
+|---|---|
+| Command line | `/proc/<pid>/cmdline` |
+| Executable path | `/proc/<pid>/exe` |
+| UID | `/proc/<pid>/status` |
+| Start time | `/proc/<pid>/stat` field 22 |
+| **Derived group name** | Namer output over the above |
+
+The derived name and user are cached in the PID state entry. On subsequent scans, when the start time matches, the cached values are reused and `cmdline` is not read at all. This removes one read and one namer evaluation per process per scan for every long-lived process, which is the large majority.
+
+The trade: a process that rewrites its own argv, which some servers do to display status, keeps its original name until it restarts. Re-reading the command line every scan for every process to catch a rare in-place rename is not worth the cost.
+
+Controlled by `scan.cache_cmdline`, default true.
 
 ---
 
@@ -128,33 +159,35 @@ Accumulators are kept for `group_retention` (default 1h) after the group was las
          ┌───────────────────┼───────────────────┐
          v                   v                   v
   ┌─────────────┐    ┌──────────────┐    ┌──────────────┐
-  │   Filter    │    │  Namer       │    │  Scheduler   │
-  │ ignore list │    │ group naming │    │ interval,    │
-  │             │    │ rules        │    │ batch, sleep │
+  │   Filter    │    │    Namer     │    │  Scan loop   │
+  │ ignore list │    │ naming rules │    │ own timer    │
   └──────┬──────┘    └──────┬───────┘    └──────┬───────┘
          │                  │                   │
          └──────────┬───────┴───────────────────┘
                     v
             ┌───────────────┐        ┌──────────────────┐
-            │   Scanner     │<──────>│  PID State Map   │
-            │ walks /proc   │        │ prev counters,   │
-            │ in batches    │        │ start times, gen │
+            │   Scanner     │<──────>│   StateMap       │
+            │ batched walk  │        │ prev counters,   │
+            │ of /proc      │        │ start times,     │
+            │               │        │ cached names,    │
+            │               │        │ generation       │
             └───────┬───────┘        └──────────────────┘
-                    │ per-process readings
+                    │ []Process (deltas already computed)
                     v
             ┌───────────────┐        ┌──────────────────┐
-            │  Aggregator   │<──────>│ Group Accumulator│
+            │  Aggregator   │<──────>│  Accumulators    │
             │ sum gauges,   │        │ monotonic totals │
             │ add deltas    │        │ per group key    │
             └───────┬───────┘        └──────────────────┘
-                    │ group snapshot
+                    │ *Snapshot
                     v
             ┌───────────────┐
-            │   Registry    │  atomic pointer swap
+            │   Registry    │  atomic.Pointer swap
+            │ groupCollector│
             └───────┬───────┘
                     v
             ┌───────────────┐
-            │  HTTP /metrics│  reads last snapshot, never scans
+            │  HTTP server  │  reads the snapshot, never scans
             └───────────────┘
 ```
 
@@ -164,44 +197,57 @@ Accumulators are kept for `group_retention` (default 1h) after the group was las
 
 This is deliberate:
 
-- Scrape cost is constant and tiny — a serialisation of an in-memory structure.
+- Scrape cost is constant and tiny: serialising an in-memory structure.
 - Scan cost is independent of scrape frequency. Ten Prometheus servers scraping does not multiply the cost by ten.
 - A slow scan cannot cause a scrape timeout.
 - The exporter's own CPU use is a function of its configuration alone, which is what makes it predictable.
 
-The published snapshot carries the timestamp of the scan that produced it, exposed as `process_exporter_last_scan_timestamp_seconds` so that staleness is visible.
+The snapshot carries the timestamp of the scan that produced it, published as `process_exporter_last_scan_timestamp_seconds`, so staleness is visible.
 
 ## 3.3 Package layout
 
 ```
 build.sh
 go.mod
+config.example.yaml
 
-cmd/process_exporter/main.go     wiring, lifecycle, flags
+cmd/process_exporter/main.go     wiring, lifecycle, scan loop
 
-internal/config/config.go        structs, defaults, validation
+internal/config/config.go        structs and the Duration wrapper
+internal/config/defaults.go      defaults, ignore lists, naming rules
+internal/config/load.go          parse, normalise, validate
 internal/config/watcher.go       SIGHUP and file-change reload
 
-internal/procfs/procfs.go        low-level /proc readers, one per file
+internal/procfs/procfs.go        ListPIDs, IsVanished, IsDenied
+internal/procfs/system.go        clock ticks, page size, boot time, UID cache
 internal/procfs/stat.go          /proc/<pid>/stat parser
 internal/procfs/statm.go         /proc/<pid>/statm parser
 internal/procfs/status.go        /proc/<pid>/status parser
 internal/procfs/io.go            /proc/<pid>/io parser
 internal/procfs/fd.go            fd count and limit
-internal/procfs/cmdline.go       cmdline reader
-internal/procfs/system.go        boot time, clock ticks, page size, uid to name
+internal/procfs/cmdline.go       cmdline and exe readers
 
 internal/filter/filter.go        ignore list matching
-internal/namer/namer.go          group name derivation rules
+internal/namer/namer.go          group name derivation
 
-internal/scan/scan.go            batched walk, yields, per-process assembly
 internal/scan/state.go           per-PID state map, generation pruning
+internal/scan/scan.go            batched walk, yields, delta computation
 
-internal/aggregate/aggregate.go  gauge sums, counter accumulators, group snapshot
-
-internal/metrics/metrics.go      Prometheus registry and definitions
+internal/aggregate/aggregate.go  gauge sums, counter accumulators, snapshot
+internal/metrics/metrics.go      registry and prometheus.Collector
 internal/api/api.go              HTTP handlers
 ```
+
+Twenty-two Go files.
+
+## 3.4 Dependencies
+
+| Module | Purpose |
+|---|---|
+| `github.com/prometheus/client_golang` | Registry and exposition |
+| `gopkg.in/yaml.v3` | Configuration parsing |
+
+All `/proc` reading is standard library.
 
 ---
 
@@ -210,145 +256,94 @@ internal/api/api.go              HTTP handlers
 ## 4.1 Group key
 
 ```go
-// GroupKey identifies one exported series set. It contains no PID, and
-// its cardinality is bounded by the machine's software inventory rather
-// than by process churn.
-type GroupKey struct {
-    Name string // derived by the namer
-    User string // owning user name, or the numeric UID if unresolvable
+type Key struct {
+    Name string
+    User string
 }
 ```
 
-Two labels. Nothing else. Every metric in the exporter carries exactly this pair.
+Two fields. Nothing else. Every metric carries exactly this pair as labels.
 
 ## 4.2 Per-process reading
 
-Assembled fresh on every scan, consumed by the aggregator, discarded.
+Assembled fresh each scan, consumed by the aggregator, discarded.
 
 ```go
-// Process is one process as read in one scan. It is a working value and
-// never leaves the scan.
 type Process struct {
-    PID       int
-    PPID      int
-    Comm      string   // kernel short name, max 15 chars
-    Exe       string   // resolved executable path, may be empty
-    Cmdline   []string // argv, may be empty for kernel threads
-    UID       uint32
-    User      string
-    State     byte     // R, S, D, Z, T, ...
-    StartTicks uint64  // stat field 22, identity anchor for PID reuse
+    PID, PPID  int
+    Comm       string   // kernel short name, max 15 chars
+    Name       string   // derived group name
+    User       string
+    UID        uint32
+    State      byte     // R, S, D, Z, T, I, ...
+    StartTicks uint64   // identity anchor
+    StartUnix  float64
 
-    // Gauges — instantaneous, read fresh each scan
-    RSSBytes    uint64
-    VSizeBytes  uint64
-    SharedBytes uint64
-    DataBytes   uint64
-    Threads     int
-    OpenFDs     int    // -1 when not read this scan or not permitted
-    MaxFDs      int    // -1 when unknown
-    OldestStart float64 // unix seconds
+    // Gauges
+    RSSBytes, VSizeBytes, SharedBytes, DataBytes uint64
+    Threads, OpenFDs, MaxFDs                     int
 
-    // Counters — lifetime totals, differenced against state
-    UTimeTicks  uint64
-    STimeTicks  uint64
-    MinorFaults uint64
-    MajorFaults uint64
-    VolCtxSw    uint64
-    InvolCtxSw  uint64
-    ReadBytes   uint64
-    WriteBytes  uint64
+    // Counter deltas, already differenced against state
+    DUTimeTicks, DSTimeTicks   uint64
+    DMinorFaults, DMajorFaults uint64
+    DVolCtxSw, DInvolCtxSw     uint64
+    DReadBytes, DWriteBytes    uint64
 
-    // Read status, so that "unknown" is distinguishable from "zero"
-    HaveIO     bool
-    HaveStatus bool
-    HaveFDs    bool
+    // Read status
+    HaveDeltas, HaveIO, HaveFDs, HaveStatus bool
 }
 ```
 
-The three `Have*` fields matter. An unprivileged exporter cannot read `/proc/<pid>/io` for processes it does not own. Reporting zero would be a lie. The aggregator skips the metric entirely for that process, and the group's I/O total reflects only the processes it could read.
+The four `Have*` fields matter. An unprivileged exporter cannot read `/proc/<pid>/io` for processes it does not own. Reporting zero would be a lie. The aggregator skips the metric for that process and reports coverage instead.
 
 ## 4.3 Per-PID state
 
 ```go
-// PIDState is the memory between scans that makes counter deltas
-// possible. It is keyed by PID and validated by StartTicks.
 type PIDState struct {
-    StartTicks uint64 // must match, or the PID was reused
-    Generation uint64 // scan number when last seen; older means gone
+    StartTicks uint64  // must match, or the PID was reused
+    Generation uint64  // scan number when last seen
 
-    UTimeTicks  uint64
-    STimeTicks  uint64
-    MinorFaults uint64
-    MajorFaults uint64
-    VolCtxSw    uint64
-    InvolCtxSw  uint64
-    ReadBytes   uint64
-    WriteBytes  uint64
+    UTimeTicks, STimeTicks   uint64
+    MinorFaults, MajorFaults uint64
+    VolCtxSw, InvolCtxSw     uint64
+    ReadBytes, WriteBytes    uint64
+
+    // Cached, immutable for the process lifetime
+    Name string
+    User string
+    UID  uint32
+
+    // Cached descriptor values, refreshed only on an fd scan
+    OpenFDs, MaxFDs int
+    HaveFDs         bool
 }
 ```
 
-Eight counters plus two identity fields. Roughly 80 bytes per process. Two thousand processes costs 160 KB, which is negligible.
+Roughly 120 bytes per process. Two thousand processes costs 240 KB.
 
-## 4.4 Group accumulator
-
-```go
-// GroupAccum holds the monotonic totals for one group. It survives the
-// disappearance of every member process, so that a restarted service
-// does not reset its counters.
-type GroupAccum struct {
-    UTimeSeconds float64
-    STimeSeconds float64
-    MinorFaults  uint64
-    MajorFaults  uint64
-    VolCtxSw     uint64
-    InvolCtxSw   uint64
-    ReadBytes    uint64
-    WriteBytes   uint64
-
-    LastSeen time.Time // for group_retention pruning
-}
-```
-
-## 4.5 Snapshot
+## 4.4 Group accumulator and sample
 
 ```go
-// Snapshot is one complete scan result, published atomically.
-type Snapshot struct {
-    Groups    map[GroupKey]*GroupSample
-    ScanAt    time.Time
-    Duration  time.Duration
-    Generation uint64
-
-    ProcsTotal    int // seen in /proc
-    ProcsScanned  int // successfully read
-    ProcsIgnored  int // matched the ignore list
-    ProcsVanished int // exited mid-scan
-    ProcsDenied   int // permission denied on a required file
+type Accum struct {
+    UTimeSeconds, STimeSeconds float64
+    MinorFaults, MajorFaults   uint64
+    VolCtxSw, InvolCtxSw       uint64
+    ReadBytes, WriteBytes      uint64
+    LastSeen                   time.Time
 }
 
-// GroupSample is the exported state of one group at one instant.
-type GroupSample struct {
-    Key GroupKey
+type Sample struct {
+    Key Key
 
-    // Gauges, summed across live members
-    NumProcs    int
-    Threads     int
-    RSSBytes    uint64
-    VSizeBytes  uint64
-    SharedBytes uint64
-    DataBytes   uint64
-    OpenFDs     int
-    MaxFDs      int
-    OldestStart float64
-    States      map[byte]int
+    NumProcs, Threads                            int
+    RSSBytes, VSizeBytes, SharedBytes, DataBytes uint64
+    OpenFDs, MaxFDs                              int
+    OldestStart                                  float64
+    StateNames                                   map[string]int
 
-    // Counters, copied from the accumulator
-    Accum GroupAccum
+    Accum Accum
 
-    // Coverage, so partial data is visible rather than silent
-    FDsRead int // members whose fd count was read this scan
-    IORead  int // members whose io file was readable
+    FDsRead, IORead int   // coverage
 }
 ```
 
@@ -359,56 +354,46 @@ type GroupSample struct {
 ## 5.1 The scan cycle
 
 ```
-1.  gen++
-2.  list /proc, collect numeric directory names as PIDs
-3.  for each batch of `batch_size` PIDs:
-      a.  for each PID in batch:
-            read cheap files
-            apply ignore filter
-            derive group name and user
-            read expensive files if this scan is an fd-scan
-            look up state, validate start time, compute deltas
-            accumulate into group
-            update state, stamp generation
-      b.  sleep `batch_sleep`
-4.  prune state entries with generation < gen
-5.  prune group accumulators older than `group_retention`
-6.  build snapshot, publish by atomic pointer swap
+1.  gen++, scanNo++
+2.  ListPIDs from /proc
+3.  for each batch of batch_size PIDs:
+      for each PID:
+        read stat                          (always)
+        lookup state, validate start time
+        read cmdline                       (if filter or namer needs it)
+        read status                        (if configured or user unknown)
+        apply filter → skip and Touch if ignored
+        resolve name                       (cached, or namer)
+        read statm                         (always)
+        read io                            (if configured and permitted)
+        read fd/ and limits                (if this is an fd scan)
+        compute deltas against state
+        store new state
+      sleep batch_sleep
+4.  Prune state entries older than gen
+5.  measure self CPU delta
+6.  Aggregate into snapshot
+7.  Publish by atomic pointer swap
 ```
 
-## 5.2 Cheap and expensive reads
+## 5.2 Read costs and frequencies
 
 | File | Contains | Cost | Frequency |
 |---|---|---|---|
-| `/proc/<pid>/stat` | CPU ticks, state, threads, start time, faults, PPID | One small read, one parse | Every scan |
-| `/proc/<pid>/statm` | RSS, VSize, shared, data, in pages | One small read | Every scan |
-| `/proc/<pid>/cmdline` | argv, NUL-separated | One small read | Every scan (see 5.3) |
-| `/proc/<pid>/status` | UID, context switches | One read, ~50 lines | Every scan |
-| `/proc/<pid>/io` | Bytes read and written | One read, needs privilege | Every scan, if permitted |
-| `/proc/<pid>/fd/` | Open descriptors | **Directory walk** | Every `fd_scan_every` scans |
-| `/proc/<pid>/limits` | Descriptor limit | One read, ~16 lines | Same as fd |
+| `stat` | CPU ticks, state, threads, start time, faults, PPID, VSize, RSS | One small read | Every scan |
+| `statm` | RSS, VSize, shared, data, in pages | One small read | Every scan |
+| `status` | UID, context switches | One read, ~50 lines | Every scan if `read_status` |
+| `cmdline` | argv | One small read | Only when uncached or the filter needs it |
+| `exe` | Executable path | One readlink | Only when deriving a new name |
+| `io` | Bytes read and written | One read, needs privilege | Every scan if `read_io` |
+| `fd/` | Open descriptors | **Directory walk** | Every `fd_scan_every` scans |
+| `limits` | Descriptor limit | One read, ~16 lines | Same as `fd/` |
 
-The cost difference is not marginal. `stat` and `statm` are generated by the kernel from in-memory structures in microseconds. Enumerating `/proc/<pid>/fd/` requires walking the file descriptor table and producing a directory entry for each one. A process holding ten thousand descriptors makes that one read cost more than a hundred `stat` reads.
+The cost difference is not marginal. `stat` and `statm` are generated by the kernel from in-memory structures in microseconds. Enumerating `/proc/<pid>/fd/` requires walking the file descriptor table and producing a directory entry for each one; a process holding ten thousand descriptors costs more than a hundred `stat` reads.
 
-This is why fd counting has its own frequency. Open file counts change slowly; a sixty-second refresh is adequate. CPU needs a fifteen-second refresh to be useful.
+**Descriptor counts are cached between fd scans.** Without this the gauge would drop to zero on the three scans out of four that skip the walk, which would look like every process closing all its files. The cached value is reported instead.
 
-## 5.3 Caching immutable values
-
-Several values never change for the life of a process:
-
-| Value | Source | Cacheable |
-|---|---|---|
-| `cmdline` | `/proc/<pid>/cmdline` | Yes, almost always |
-| `exe` | `/proc/<pid>/exe` symlink | Yes |
-| UID | `/proc/<pid>/status` | Practically yes |
-| Start time | `/proc/<pid>/stat` | Yes, by definition |
-| Derived group name | Namer output | Yes, follows from the above |
-
-The derived group name is cached in the PID state entry. On subsequent scans, if the start time matches, the cached name and user are reused and `cmdline` is not read at all. This removes one read and one namer evaluation per process per scan for every long-lived process, which is the large majority.
-
-A process can rewrite its own argv, which some servers do to show status. The cache means such changes are not picked up until the process restarts. This is an accepted trade: re-reading cmdline every scan for every process to catch a rare in-place rename is not worth the cost.
-
-## 5.4 Batching and yielding
+## 5.3 Batching and yielding
 
 ```yaml
 scan:
@@ -425,61 +410,70 @@ duration ≈ (procs / batch_size) × batch_sleep + procs × read_cost
 
 With 2,000 processes, batch 50, sleep 5ms:
 
-```
-(2000 / 50) × 5ms = 200ms of sleeping
-```
+- Sleeping: `(2000 / 50) × 5ms = 200ms`
+- Reading: roughly 40 to 100ms at 20 to 50 microseconds per process
 
-Plus the actual read time, which for cheap reads is on the order of 20 to 50 microseconds per process, so 40 to 100ms. Total scan time roughly 250 to 300ms out of a 15-second interval, of which two thirds is sleep.
+Total roughly 250 to 300ms out of a 15-second interval, of which two thirds is sleep. The resulting CPU share is about `100ms / 15s ≈ 0.7%` of one core.
 
-The resulting CPU share is approximately `100ms / 15s ≈ 0.7%` of one core.
+The sleep is not wasted time. It is what stops the scheduler from treating the exporter as a CPU-bound task, which is precisely what keeps it off the top of `top`.
 
-### The tuning relationship
+### Tuning relationships
 
-| Parameter change | CPU use | Scan duration | Snapshot coherence |
+| Change | CPU use | Scan duration | Snapshot coherence |
 |---|---|---|---|
 | Larger `batch_size` | Higher | Shorter | Better |
 | Longer `batch_sleep` | Lower | Longer | Worse |
 | Shorter `interval` | Higher | Unchanged | Unchanged |
 
-**Snapshot coherence** is the concern that the first process read and the last are separated by the full scan duration, so the gauge snapshot is smeared across that window. For a 300ms scan this is irrelevant.
+**Snapshot coherence** is the concern that the first and last processes read are separated by the full scan duration, so the gauge snapshot is smeared across that window. For a 300ms scan this is irrelevant.
 
-Note that counter accuracy is **not** affected by the smear. Each PID's delta is computed against its own previous reading with its own elapsed time. The smear affects the simultaneity of the gauges, not the correctness of any rate.
+Counter accuracy is **not** affected. Each PID's delta uses its own two readings and its own elapsed time. The smear affects the simultaneity of gauges, not the correctness of any rate.
 
 ### Overrun protection
 
-If a scan takes longer than `interval`, the next scan does not start early or run concurrently. The scheduler skips the missed tick, increments `process_exporter_scan_overruns_total`, and logs a warning. Two scans never run at once, because they would both mutate the state map.
+If a scan exceeds `interval`, the next scan does not start early or run concurrently. The missed tick is skipped, `process_exporter_scan_overruns_total` increments, and a warning is logged. Two scans never run at once, because both would mutate the state map.
 
-## 5.5 Race tolerance
+## 5.4 Race tolerance
 
-A process can exit between the directory listing and the file read. This is the normal case at any real process turnover rate, not an error.
+A process can exit between the directory listing and any file read. This is the normal case at any real turnover rate, not an error.
 
 | Condition | Response |
 |---|---|
-| `ENOENT` opening any file | Process vanished. Skip silently, increment `ProcsVanished` |
-| `ESRCH` | Same |
-| `EACCES` or `EPERM` on `io` | Not permitted. Set `HaveIO = false`, continue |
+| `ENOENT` or `ESRCH` on any file | Vanished. Skip silently, count it |
+| `EACCES`/`EPERM` on `io` | Set `HaveIO = false`, continue |
 | `EACCES` on `fd/` | Set `HaveFDs = false`, continue |
-| `EACCES` on `stat` or `statm` | Cannot proceed. Skip, increment `ProcsDenied` |
-| Malformed content | Skip the field, continue with the rest |
+| `EACCES` on `stat` | Cannot proceed. Skip, count as denied |
+| Malformed content | Skip that field, continue with the rest |
 
-Nothing here is logged at anything above debug level. A monitoring agent that logs on every process exit is worse than useless.
+Nothing here is logged above debug level. An agent that logs on every process exit is worse than useless.
 
-## 5.6 Privilege
+## 5.5 Privilege
 
 The exporter runs at whatever privilege it was given and does not complain.
 
 | Running as | `stat`, `statm`, `status` | `io` | `fd/` |
 |---|---|---|---|
 | root | All processes | All processes | All processes |
-| Unprivileged | All processes | Own processes only | Own processes only |
+| Unprivileged | All processes | Own only | Own only |
 
-The kernel exposes `stat` and `statm` for every process regardless of ownership, so CPU, memory, and thread counts are always complete.
+The kernel exposes `stat` and `statm` for every process regardless of ownership, so **CPU, memory, and thread counts are always complete**.
 
-`io` and `fd/` require matching UID or `CAP_SYS_PTRACE`. An unprivileged exporter gets them for its own processes only.
+At start, an unprivileged instance logs once:
 
-The coverage counters `FDsRead` and `IORead` make this visible in the metrics, so an operator can tell partial data from zero data.
+```
+running unprivileged; CPU and memory will be complete, while io and fd
+data will cover only processes owned by this user
+```
 
-Running as root gives complete data. Running unprivileged gives complete CPU and memory data and partial I/O and descriptor data. Both are supported and neither produces an error.
+The coverage ratios make it visible in the metrics thereafter.
+
+## 5.6 Parsing detail: the comm field
+
+`/proc/<pid>/stat` wraps the process name in parentheses, and the name may itself contain spaces and parentheses. A naive split on spaces produces wrong field offsets for any such process — and therefore silently wrong CPU numbers.
+
+The parser locates the **final** closing parenthesis and splits only the remainder. Field numbering then follows proc(5) with field 3 at index 0 of the remainder.
+
+Note in the sample output that `process_exporte` appears without its final `r`. `comm` is truncated to fifteen characters by the kernel. This is expected and is why the naming rules exist for cases where the truncated name is insufficient.
 
 ---
 
@@ -487,103 +481,49 @@ Running as root gives complete data. Running unprivileged gives complete CPU and
 
 ## 6.1 Purpose
 
-A default Linux machine runs a large number of kernel threads and system processes that carry no useful signal:
+A default Linux machine runs many kernel threads and driver helpers that carry no useful signal:
 
 ```
 kworker/0:1, kworker/u16:3, ksoftirqd/0, migration/0, rcu_sched,
 kthreadd, watchdog/0, kdevtmpfs, kcompactd0, khugepaged, ...
 ```
 
-Kernel threads have no address space of their own, so their memory readings are meaningless. Their CPU is real but is better observed through `node_exporter`'s system-wide metrics. Their names are numerous and machine-specific — `kworker/u16:3` is a distinct name from `kworker/u16:4` — so they are a cardinality problem as well as a noise problem.
+Kernel threads have no address space of their own, so their memory readings are meaningless. Their CPU is real but is better observed through `node_exporter`'s system-wide metrics. Their names are numerous and machine-specific — `kworker/u16:3` and `kworker/u16:4` are distinct names — so they are a cardinality problem as well as a noise problem.
 
-The ignore list removes them.
+## 6.2 Rules and evaluation order
 
-## 6.2 Rule types
+1. **`include_only`** — when non-empty, a process must match one of these patterns to survive. Everything below still applies to what does.
+2. **`ignore_kernel_threads`** — empty cmdline, or PPID of 2.
+3. **`ignore_comm`** — exact match.
+4. **`ignore_comm_prefix`** — prefix match.
+5. **`ignore_comm_regex`** — regex match.
+6. **`ignore_cmdline_regex`** — regex against the joined command line.
+7. **`ignore_users`** — exact match on the resolved user.
 
-```yaml
-filter:
-  ignore_kernel_threads: true
+An ignored process is counted and its state entry is **stamped rather than dropped**, so it is not rebuilt from scratch on every scan.
 
-  ignore_comm:
-    - kthreadd
-    - ksoftirqd
-    - migration
-    - rcu_sched
-    - rcu_bh
-    - watchdog
-    - kdevtmpfs
-    - kcompactd0
-    - khugepaged
-    - kswapd0
-    - kauditd
-    - oom_reaper
-    - writeback
-    - kblockd
-    - kintegrityd
-    - md
-    - edac-poller
-    - devfreq_wq
-    - watchdogd
-    - kthrotld
-    - ipv6_addrconf
-    - kstrp
-    - charger_manager
-    - scsi_eh
-    - scsi_tmf
-    - jbd2
-    - ext4-rsv-conver
+## 6.3 The read-order optimisation
 
-  ignore_comm_prefix:
-    - "kworker/"
-    - "ksoftirqd/"
-    - "migration/"
-    - "watchdog/"
-    - "irq/"
-    - "cpuhp/"
-    - "idle_inject/"
-    - "scsi_eh_"
-    - "scsi_tmf_"
-    - "nfsd"
-    - "loop"
+`FilterConfig.NeedsCmdline()` reports whether any rule requires the command line. When false, the filter is applied after `stat` and before every other read, so an **ignored process costs exactly one small read**.
 
-  ignore_comm_regex:
-    - "^kworker/u?[0-9]+:[0-9]+"
+A configuration using `ignore_cmdline_regex`, `ignore_kernel_threads`, or `include_only` pays for `cmdline` on every process. This is documented so an operator can choose to avoid it. Note that `ignore_kernel_threads` is true by default, so the default configuration does read cmdline for uncached processes — but the name cache means this is only for processes not seen on the previous scan.
 
-  ignore_cmdline_regex: []
-
-  ignore_users: []
-
-  include_only: []
-```
-
-### Evaluation order
-
-1. If `include_only` is non-empty, the process must match at least one of its patterns or it is dropped. Everything below still applies to what survives.
-2. `ignore_kernel_threads` — dropped if a kernel thread (see 6.3).
-3. `ignore_comm` — exact match against `comm`.
-4. `ignore_comm_prefix` — prefix match against `comm`.
-5. `ignore_comm_regex` — regex match against `comm`.
-6. `ignore_cmdline_regex` — regex match against the joined command line.
-7. `ignore_users` — exact match against the resolved user name.
-
-A dropped process is counted in `ProcsIgnored` and is not read further, which saves the expensive reads.
-
-The filter is applied after `stat` and before `cmdline`, `status`, `io`, and `fd/`, so that an ignored process costs one small read rather than five reads and a directory walk. `ignore_cmdline_regex` is the exception: matching against the command line requires reading it, so a configuration using that rule pays for `cmdline` on every process. This is documented so an operator can choose to avoid it.
-
-## 6.3 Kernel thread detection
+## 6.4 Kernel thread detection
 
 Two signals, either sufficient:
 
-- `/proc/<pid>/cmdline` is empty. Kernel threads have no argv.
-- The process's ancestry reaches PID 2 (`kthreadd`). Checking `PPID == 2` catches the direct children, which is the majority; full ancestry walking is not worth the cost.
+- Empty `/proc/<pid>/cmdline`. Kernel threads have no argv.
+- `PPID == 2`, which is `kthreadd`.
 
-With `ignore_kernel_threads: true`, the empty-cmdline test alone removes essentially all of them. The explicit `ignore_comm` and prefix lists are belt and braces, and are also useful when kernel thread filtering is turned off for a specific investigation.
+Full ancestry walking is not performed: the direct children are the overwhelming majority, and the walk would cost one read per generation for every process on the machine.
 
-## 6.4 Defaults
+## 6.5 Defaults
 
-The shipped default configuration includes the full list above. It is intended to be adequate on a stock Linux server without modification, and to be extended by the operator for site-specific noise.
+The shipped configuration includes roughly fifty exact names, eighteen prefixes, and one regex, covering the standard kernel threads on a stock server.
 
-Per your decision, there is **no cardinality limit and no overflow bucket**. The ignore list is the control. If it is misconfigured, the output is noisy — which is visible, diagnosable, and the operator's choice.
+A **nil** list in the configuration means "not mentioned" and gets the defaults. An **explicitly empty** list means "I want nothing", disabling the default for that rule type.
+
+Per the design decision, there is **no cardinality limit and no overflow bucket**. The ignore list is the control.
 
 ---
 
@@ -591,121 +531,114 @@ Per your decision, there is **no cardinality limit and no overflow bucket**. The
 
 ## 7.1 The problem
 
-A process name is not one unambiguous value. Three candidates exist and they disagree:
+A process name is not one unambiguous value:
 
-| Source | Value for a Java service | Value for a Python service |
+| Source | Java service | Python service |
 |---|---|---|
-| `comm` from `stat` | `java` | `python3` |
+| `comm` | `java` | `python3` |
 | `cmdline[0]` | `/usr/lib/jvm/java-17/bin/java` | `/usr/bin/python3` |
-| basename of `cmdline[0]` | `java` | `python3` |
+| basename | `java` | `python3` |
 
-None of these identifies *which* Java service. That information is in argv, several arguments in.
-
-Grouping on `comm` alone puts every JVM on the machine into one bucket, which destroys the distinction that matters most.
+None identifies *which* service. That information is in argv, several arguments in. Grouping on `comm` alone puts every JVM on the machine into one bucket, which destroys the distinction that matters most.
 
 ## 7.2 Rule specification
 
-An ordered list of rules. The first match wins. If none matches, the fallback applies.
+An ordered list. Each rule has a match condition, an optional extraction, and a name template.
 
 ```yaml
 naming:
-  fallback: comm          # comm | exe_basename | cmdline_basename
-
+  fallback: comm
+  resolve_users: true
   rules:
-    # Java: name by the main class or the jar file
     - match_comm: java
       from: cmdline
-      regex: "-jar\\s+\\S*/([^/\\s]+)\\.jar"
-      name: "java/$1"
+      regex: '-jar\s+\S*?([^/\s]+)\.jar'
+      name: 'java/$1'
 
     - match_comm: java
       from: cmdline
-      regex: "\\s([a-zA-Z][a-zA-Z0-9_.]*\\.[A-Z][a-zA-Z0-9_]*)(?:\\s|$)"
-      name: "java/$1"
+      regex: '\s([a-zA-Z][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_]+)*\.[A-Z][a-zA-Z0-9_]*)(?:\s|$)'
+      name: 'java/$1'
 
-    # Python: name by the script
     - match_comm_prefix: python
       from: cmdline
-      regex: "([^/\\s]+)\\.py"
-      name: "python/$1"
-
-    # Node: name by the script
-    - match_comm: node
-      from: cmdline
-      regex: "([^/\\s]+)\\.js"
-      name: "node/$1"
-
-    # systemd user sessions collapse to one group
-    - match_comm: systemd
-      from: cmdline
-      regex: "--user"
-      name: "systemd-user"
-
-    # Container runtime shims: strip the container ID
-    - match_comm_prefix: "containerd-shim"
-      name: "containerd-shim"
+      regex: '([^/\s]+)\.py'
+      name: 'python/$1'
 ```
-
-### Rule fields
 
 | Field | Meaning |
 |---|---|
 | `match_comm` | Exact match against `comm` |
-| `match_comm_prefix` | Prefix match against `comm` |
-| `match_comm_regex` | Regex match against `comm` |
-| `match_exe_regex` | Regex match against the resolved executable path |
-| `from` | Which text the extraction regex runs against: `comm`, `exe`, or `cmdline` |
+| `match_comm_prefix` | Prefix match |
+| `match_comm_regex` | Regex match |
+| `match_exe_regex` | Regex against the resolved executable path |
+| `from` | Text the extraction runs against: `comm`, `exe`, or `cmdline` |
 | `regex` | Extraction pattern with capture groups |
-| `name` | Output template; `$1`, `$2` reference capture groups |
+| `name` | Template; `$1`, `$2` reference groups |
 
-If a rule matches but its extraction regex does not, evaluation continues to the next rule. This lets the two Java rules above act as a jar-first, then main-class, cascade.
+## 7.3 The cascade
 
-If `regex` is absent, `name` is used literally. This is the `containerd-shim` case: match the prefix, discard everything else, emit a constant.
+**A rule that matches but whose extraction fails falls through to the next rule.** This is what makes the two Java rules work as a pair: the first catches `-jar app.jar`, the second catches a bare main class. A JVM invoked either way gets a useful name.
 
-## 7.3 The naming rule is the cardinality control
+A rule with no `regex` emits its template literally. This is how the container shims collapse: match the prefix `containerd-shim`, discard the container ID that follows, emit a constant. Without it, every container would produce its own series.
 
-You declined a hard limit, and that is a reasonable position, but the mechanism should be understood:
+## 7.4 Fallback
 
-A rule that extracts too much detail reintroduces the unbounded growth that grouping was meant to prevent. A rule producing a name containing a PID, a UUID, a timestamp, a port number, or a container ID creates one series per process instance.
+When no rule matches:
+
+| `fallback` | Result |
+|---|---|
+| `comm` | Kernel short name, truncated to 15 characters |
+| `exe_basename` | Basename of the resolved executable |
+| `cmdline_basename` | Basename of `cmdline[0]` |
+
+The observed `process_exporte` in the sample output is `comm` truncation in action.
+
+## 7.5 Naming rules are the cardinality control
+
+You declined a hard limit, which is a reasonable position, but the mechanism should be understood.
+
+A rule extracting an unbounded value reintroduces the growth that grouping exists to prevent.
 
 **Anti-pattern:**
 ```yaml
 - match_comm: java
-  from: cmdline
-  regex: "-Dinstance=(\\S+)"     # instance IDs are per-process
-  name: "java/$1"
+  regex: '-Dinstance=(\S+)'     # instance IDs are per-process
+  name: 'java/$1'
 ```
 
 **Correct:**
 ```yaml
 - match_comm: java
-  from: cmdline
-  regex: "-Dservice=(\\S+)"      # service names are bounded
-  name: "java/$1"
+  regex: '-Dservice=(\S+)'      # service names are bounded
+  name: 'java/$1'
 ```
 
-The diagnostic is `process_exporter_groups_total`. If it grows steadily rather than sitting flat, a naming rule is extracting something unbounded.
+Two metrics form the diagnostic:
 
-The exporter also exposes `process_exporter_group_names_seen_total`, a counter of distinct names ever observed. A large gap between the two indicates churn: many names appear briefly and disappear.
+- `process_exporter_groups_total` — currently exported groups
+- `process_exporter_group_names_seen_total` — distinct names ever observed
 
-## 7.4 Name sanitisation
+A **widening gap** between them means names appear briefly and disappear, which is the signature of an unbounded extraction.
+
+## 7.6 Sanitisation
 
 Derived names are sanitised before use as a label value:
 
-- Truncate to 128 characters.
-- Replace any character outside `[a-zA-Z0-9_./-]` with `_`.
-- If the result is empty, fall back to `comm`; if `comm` is also empty, use `unknown`.
+- Truncated to 128 characters.
+- Characters outside `[a-zA-Z0-9_./-]` replaced with `_`.
+- Leading and trailing underscores trimmed.
+- Empty result becomes `unknown`, because a label value must not be empty.
 
-## 7.5 User resolution
+This bounds the memory cost of a rule that accidentally captures a whole command line, and stops a process embedding arbitrary bytes in argv from producing an unqueryable label.
+
+## 7.7 User resolution
 
 The UID comes from `/proc/<pid>/status`, field `Uid:`, first value (the real UID).
 
-Resolution to a name uses a cache built at start from `/etc/passwd` and refreshed on the same interval as configuration reload. A UID with no entry is rendered as its number in a fixed form: `uid:1001`. This keeps container-created UIDs, which have no passwd entry on the host, from becoming a resolution failure.
+Resolution uses a cache built from `/etc/passwd` at start and refreshed on configuration reload. A UID with no entry falls back to `user.LookupId`, then to `uid:NNNN`. Container-created UIDs with no host passwd entry therefore render as `uid:1001` rather than failing.
 
-```yaml
-naming:
-  resolve_users: true    # false emits numeric UIDs, saving the lookup
-```
+`resolve_users: false` emits numeric UIDs throughout, saving the lookup.
 
 ---
 
@@ -713,54 +646,60 @@ naming:
 
 ## 8.1 Gauge aggregation
 
-Summed across live members of the group in the current scan:
+Summed across live members in the current scan:
 
 | Metric | Aggregation | Note |
 |---|---|---|
-| `NumProcs` | Count | Group membership |
+| `NumProcs` | Count | |
 | `Threads` | Sum | |
-| `RSSBytes` | Sum | Over-counts shared pages between members |
+| `RSSBytes` | Sum | Over-counts shared pages |
 | `VSizeBytes` | Sum | Nearly meaningless summed; kept for completeness |
 | `SharedBytes` | Sum | |
-| `DataBytes` | Sum | Private writable, the closest to "real" memory |
-| `OpenFDs` | Sum | Only over members where `HaveFDs` |
-| `MaxFDs` | Sum | Sum matches OpenFDs so a ratio is meaningful |
-| `OldestStart` | **Minimum** | Group age; when the oldest member started |
-| `States` | Count per state letter | |
+| `DataBytes` | Sum | Private writable; closest to unshared memory |
+| `OpenFDs` | Sum | Only members where `HaveFDs` |
+| `MaxFDs` | Sum | Matched to OpenFDs so the ratio is meaningful |
+| `OldestStart` | **Minimum** | Group age; changes on restart |
+| `States` | Count per state | |
 
 ### The RSS caveat
 
-Summing RSS across processes that share pages over-counts. Forty `nginx` workers forked from one master share most of their text and much of their data. The sum is larger than the group's true footprint.
+Summing RSS across processes that share pages over-counts. Forty `nginx` workers forked from one master share most of their text and much of their data; the sum exceeds the group's true footprint.
 
-This is documented rather than corrected. Computing proportional set size requires reading `/proc/<pid>/smaps` or `smaps_rollup`, which is expensive enough to defeat the low-CPU requirement. `DataBytes` (private writable pages) is exported alongside RSS as the closer approximation to unshared memory.
+This is documented rather than corrected. Computing proportional set size requires `/proc/<pid>/smaps` or `smaps_rollup`, which is expensive enough to defeat the low-CPU requirement. `DataBytes` is published alongside as the closer approximation.
 
-An operator comparing `process_group_memory_rss_bytes` against `node_memory_MemTotal_bytes` must understand that group totals can exceed physical memory. This is an artefact of the summation, not a bug.
+**A group's RSS total can exceed physical memory.** This is an artefact of the summation, not a bug.
+
+### MaxFDs summation
+
+`MaxFDs` is summed rather than minimised, so that `open_fds / max_fds` is a meaningful ratio for the group. A limit of `unlimited` reads as −1 and is excluded from the sum.
 
 ## 8.2 Counter aggregation
 
 Per scan, per group:
 
 ```
-group_delta = Σ over pids in group of max(0, now[pid] - prev[pid])
+group_delta = Σ over pids of max(0, now[pid] − prev[pid])
 accumulator[group] += group_delta
 ```
 
-CPU ticks convert to seconds by dividing by `sysconf(_SC_CLK_TCK)`, which is 100 on essentially all Linux systems but is read at start rather than assumed.
-
-The `max(0, ...)` clamp discards negative deltas from PID reuse that the start-time check missed.
+CPU ticks convert to seconds by dividing by `sysconf(_SC_CLK_TCK)`, which is read at start rather than assumed.
 
 A PID with no previous state contributes nothing this scan. Its state is recorded and it contributes from the next scan onward.
 
 ## 8.3 Coverage reporting
 
-`FDsRead` and `IORead` count how many members of the group had those files successfully read. Exported as:
+`FDsRead` and `IORead` count members whose respective files were readable:
 
 ```
 process_group_fd_coverage_ratio{name, user}
 process_group_io_coverage_ratio{name, user}
 ```
 
-A ratio of 1.0 means the group's descriptor or I/O totals are complete. A ratio of 0.3 means only 30% of members contributed and the total is a lower bound. This is the difference between "this group does no I/O" and "I cannot see this group's I/O", which are entirely different facts.
+A ratio of 1.0 means the total is complete. A ratio of 0.3 means only 30% of members contributed and the total is a lower bound.
+
+This is the difference between "this group does no I/O" and "I cannot see this group's I/O", which are entirely different facts.
+
+Correspondingly, **descriptor and I/O metrics are omitted rather than zeroed** when nothing was readable. An unprivileged exporter emits no `process_group_open_fds` for a group it cannot see into, and the coverage ratio says why.
 
 ---
 
@@ -768,189 +707,226 @@ A ratio of 1.0 means the group's descriptor or I/O totals are complete. A ratio 
 
 ## 9.1 Labels
 
-Every process-group metric carries exactly two labels:
-
-```
-name, user
-```
-
-No PID. No command line. No container ID. No PPID.
+Every process-group metric carries exactly two labels: `name` and `user`. No PID, no command line, no container ID, no PPID.
 
 ## 9.2 Gauges
 
-| Metric | Unit | Description |
-|---|---|---|
-| `process_group_num_procs` | count | Live processes in the group |
-| `process_group_num_threads` | count | Total threads |
-| `process_group_memory_rss_bytes` | bytes | Resident set, summed |
-| `process_group_memory_vsize_bytes` | bytes | Virtual size, summed |
-| `process_group_memory_shared_bytes` | bytes | Shared pages, summed |
-| `process_group_memory_data_bytes` | bytes | Private writable, summed |
-| `process_group_open_fds` | count | Open descriptors, summed |
-| `process_group_max_fds` | count | Descriptor limits, summed |
-| `process_group_oldest_start_time_seconds` | unix seconds | Oldest member's start |
-| `process_group_states{state}` | count | Processes in each state, extra `state` label |
-| `process_group_fd_coverage_ratio` | ratio | Members whose fd count was read |
-| `process_group_io_coverage_ratio` | ratio | Members whose io was readable |
+| Metric | Unit |
+|---|---|
+| `process_group_num_procs` | count |
+| `process_group_num_threads` | count |
+| `process_group_memory_rss_bytes` | bytes |
+| `process_group_memory_vsize_bytes` | bytes |
+| `process_group_memory_shared_bytes` | bytes |
+| `process_group_memory_data_bytes` | bytes |
+| `process_group_open_fds` | count |
+| `process_group_max_fds` | count |
+| `process_group_oldest_start_time_seconds` | unix seconds |
+| `process_group_states{state}` | count |
+| `process_group_fd_coverage_ratio` | ratio |
+| `process_group_io_coverage_ratio` | ratio |
+
+State values are readable names: `running`, `sleeping`, `disk_sleep`, `zombie`, `stopped`, `idle`, and so on.
 
 ## 9.3 Counters
 
-| Metric | Unit | Description |
-|---|---|---|
-| `process_group_cpu_seconds_total{mode}` | seconds | `mode` is `user` or `system` |
-| `process_group_minor_page_faults_total` | count | |
-| `process_group_major_page_faults_total` | count | |
-| `process_group_context_switches_total{kind}` | count | `kind` is `voluntary` or `involuntary` |
-| `process_group_read_bytes_total` | bytes | From `io`, `read_bytes` |
-| `process_group_write_bytes_total` | bytes | From `io`, `write_bytes` |
+| Metric | Unit |
+|---|---|
+| `process_group_cpu_seconds_total{mode="user"\|"system"}` | seconds |
+| `process_group_minor_page_faults_total` | count |
+| `process_group_major_page_faults_total` | count |
+| `process_group_context_switches_total{kind="voluntary"\|"involuntary"}` | count |
+| `process_group_read_bytes_total` | bytes |
+| `process_group_write_bytes_total` | bytes |
 
 ## 9.4 Exporter self-metrics
 
-| Metric | Type | Description |
+| Metric | Type | Meaning |
 |---|---|---|
-| `process_exporter_scan_duration_seconds` | Histogram | Wall time of one scan |
-| `process_exporter_scan_cpu_seconds_total` | Counter | CPU the exporter itself consumed |
+| `process_exporter_scan_duration_seconds` | Histogram | Wall time per scan |
+| `process_exporter_scan_cpu_seconds_total` | Counter | **The exporter's own CPU cost** |
 | `process_exporter_scans_total` | Counter | Completed scans |
-| `process_exporter_scan_overruns_total` | Counter | Scans that exceeded the interval |
-| `process_exporter_last_scan_timestamp_seconds` | Gauge | Freshness of the published snapshot |
-| `process_exporter_procs_total` | Gauge | PIDs seen in `/proc` |
+| `process_exporter_scan_overruns_total` | Counter | Scans exceeding the interval |
+| `process_exporter_last_scan_timestamp_seconds` | Gauge | Snapshot freshness |
+| `process_exporter_procs_total` | Gauge | PIDs seen |
 | `process_exporter_procs_scanned` | Gauge | Successfully read |
 | `process_exporter_procs_ignored` | Gauge | Matched the ignore list |
 | `process_exporter_procs_vanished` | Gauge | Exited mid-scan |
-| `process_exporter_procs_denied` | Gauge | Permission denied on a required file |
-| `process_exporter_groups_total` | Gauge | Distinct groups currently exported |
-| `process_exporter_group_names_seen_total` | Counter | Distinct names ever observed |
-| `process_exporter_state_entries` | Gauge | Size of the per-PID state map |
-| `process_exporter_read_errors_total{file}` | Counter | Read failures by file kind |
+| `process_exporter_procs_denied` | Gauge | Permission denied |
+| `process_exporter_groups_total` | Gauge | Distinct groups exported |
+| `process_exporter_group_names_seen_total` | Gauge | Distinct names ever seen |
+| `process_exporter_state_entries` | Gauge | Per-PID state map size |
+| `process_exporter_read_errors_total{file}` | Counter | Genuine read failures |
 | `process_exporter_build_info{version,goversion}` | Gauge | Constant 1 |
 
-`process_exporter_scan_cpu_seconds_total` deserves emphasis. The exporter measures its own CPU cost and publishes it. An operator can verify directly that the tuning goal is being met:
+`process_exporter_scan_cpu_seconds_total` is measured with `getrusage(RUSAGE_SELF)` around each scan. It lets an operator verify the low-cost requirement directly:
 
 ```promql
 rate(process_exporter_scan_cpu_seconds_total[5m]) < 0.02
 ```
 
-## 9.5 Cardinality
+`process_exporter_read_errors_total` excludes vanished processes and permission denials, both of which are normal. A non-zero value indicates a genuine parsing or filesystem problem.
+
+## 9.5 Collector implementation
+
+The metrics package implements `prometheus.Collector` over the snapshot rather than holding `GaugeVec` instances.
+
+The reason: a group that vanishes is simply absent from the next snapshot and stops being collected. There is no `Delete` call to forget and no stale series to leak. With `GaugeVec` instances, every disappearing group would require an explicit deletion, and a missed one would leave a frozen series forever.
+
+## 9.6 Cardinality
 
 ```
-series ≈ groups × (12 gauges + 6 counters + state_variants)
+series ≈ groups × (12 gauges + 6 counters + state variants)
 ```
 
-For a typical server with 60 distinct groups, roughly 1,200 series. For a busy application server with 200 groups, roughly 4,000.
+| Machine type | Groups | Approximate series |
+|---|---|---|
+| Small server | 20 | 400 |
+| Typical server | 60 | 1,200 |
+| Busy application server | 200 | 4,000 |
 
-Compare against the PID-keyed alternative: 2,000 live processes at any instant, with complete turnover of short-lived ones, produces tens of thousands of series per day and never stops growing.
+Compare against the PID-keyed alternative: 2,000 live processes with complete turnover of short-lived ones produces tens of thousands of series per day and never stops growing.
 
 ---
 
-# Part 10 — Configuration
+# Part 10 — HTTP API
 
-**File: `/etc/process_exporter/config.yaml`**
+| Path | Content |
+|---|---|
+| `/metrics` | Prometheus exposition |
+| `/groups` | Current snapshot as JSON, sortable |
+| `/stats` | Scan counters and self CPU |
+| `/config` | Effective configuration |
+| `/livez` | Process is running |
+| `/readyz` | At least two scans have completed |
+| `/` | Version, uptime, endpoint list |
+
+`/groups` accepts `?sort=` with values `cpu` (default), `rss`, `procs`, `fds`, or `name`. It is the debugging equivalent of `top` and answers "what is this exporter actually seeing" without going through Prometheus.
+
+`/readyz` requires **two** scans, not one, because counter values do not exist until the second scan produces the first deltas. Reporting ready after one scan would expose all-zero counters to a scraper that had just started.
+
+All reads come from the atomic snapshot pointer. No handler ever triggers a scan.
+
+---
+
+# Part 11 — Configuration
 
 ```yaml
 scan:
-  interval: 15s          # time between scan starts
-  batch_size: 50         # processes read between yields
-  batch_sleep: 5ms       # yield duration
-  fd_scan_every: 4       # read fd/ and limits every Nth scan
-  read_io: true          # attempt /proc/<pid>/io
-  read_status: true      # attempt /proc/<pid>/status for ctx switches
-  cache_cmdline: true    # cache cmdline and derived name per PID
-  group_retention: 1h    # keep accumulators after the group vanishes
+  interval: 15s
+  batch_size: 50
+  batch_sleep: 5ms
+  fd_scan_every: 4
+  read_io: true
+  read_status: true
+  cache_cmdline: true
+  group_retention: 1h
+  proc_path: /proc
 
 filter:
   ignore_kernel_threads: true
-  ignore_comm: [ ... ]           # see Part 6
-  ignore_comm_prefix: [ ... ]
-  ignore_comm_regex: [ ... ]
+  # ignore_comm, ignore_comm_prefix, ignore_comm_regex:
+  #   omit for the shipped defaults; set to [] to disable them
   ignore_cmdline_regex: []
   ignore_users: []
   include_only: []
 
 naming:
-  fallback: comm                 # comm | exe_basename | cmdline_basename
+  fallback: comm            # comm | exe_basename | cmdline_basename
   resolve_users: true
-  rules: [ ... ]                 # see Part 7
+  # rules: omit for the shipped defaults
 
 server:
   listen: "0.0.0.0:9256"
   metrics_path: /metrics
 
 log:
-  level: info                    # debug | info | warn | error
-  format: json                   # json | text
+  level: info               # debug | info | warn | error
+  format: json              # json | text
 ```
 
-## 10.1 Tuning table
+## 11.1 Tuning table
 
 | Machine | interval | batch_size | batch_sleep | fd_scan_every |
 |---|---|---|---|---|
 | Small, under 200 procs | 15s | 100 | 2ms | 2 |
-| Typical server, under 1,000 | 15s | 50 | 5ms | 4 |
+| Typical, under 1,000 | 15s | 50 | 5ms | 4 |
 | Busy, 1,000 to 5,000 | 30s | 50 | 5ms | 8 |
 | Very busy, over 5,000 | 60s | 100 | 10ms | 10 |
 | Latency-sensitive host | 60s | 25 | 20ms | 20 |
 
-The last row trades data freshness for the smallest possible footprint. It is the right choice on a machine where the exporter must be invisible.
+The last row trades freshness for the smallest possible footprint, for a machine where the exporter must be invisible.
 
-## 10.2 Reload
+## 11.2 Validation
 
-`SIGHUP` or file modification. A configuration that fails validation is rejected and the previous one stays active. Validation reports every problem at once.
+`Validate()` reports every problem at once, not just the first. It includes a scan-duration estimate:
+
+```
+scan.batch_sleep 50ms at batch_size 10 would take about 10s for 2000
+processes, which exceeds scan.interval 5s
+```
+
+`process_exporter -check -config <path>` validates without starting.
+
+## 11.3 Reload
+
+`SIGHUP` or file modification. A configuration failing validation is rejected and the previous one stays active.
 
 | Change | Effect |
 |---|---|
 | `scan.*` | Applies from the next scan |
 | `filter.*` | Applies from the next scan; newly ignored groups age out via `group_retention` |
-| `naming.*` | **Rebuilds every group name.** Series with old names age out; new ones start from zero |
+| `naming.*` | **Resets accumulators and per-PID name cache.** Every series restarts from zero |
 | `server.*` | Requires restart |
 
-A naming change is logged as a warning, because it will break every time series.
+A naming change resets **both** the aggregator and the scanner state. The accumulators are keyed on names that no longer exist, and the per-PID cache holds names derived under the old rules. Keeping either would produce wrong output. The warning says so plainly:
 
-`process_exporter -check -config <path>` validates without starting.
+```
+naming changed; accumulators and cached names discarded, every time
+series restarts from zero
+```
 
 ---
 
-# Part 11 — Operational behaviour
+# Part 12 — Operational behaviour
 
-## 11.1 Startup
+## 12.1 Startup
 
 1. Parse and validate configuration. Failure exits with code 2.
-2. Read system constants: clock ticks per second, page size, boot time.
-3. Build the UID-to-name cache.
-4. Compile filter patterns and naming rules. Failure exits with code 3.
-5. Run one **priming scan**. It publishes gauges but no counter deltas, because there is no previous state.
-6. Start the HTTP server.
-7. Start the scan timer.
+2. Read system constants: clock ticks via `getconf CLK_TCK` (fallback 100), page size, boot time from `/proc/stat` `btime`.
+3. Build the UID cache from `/etc/passwd`.
+4. Compile the filter and namer. Failure exits with code 3.
+5. Log the privilege level and its consequences.
+6. Run a **priming scan**. It publishes gauges but no counter deltas.
+7. Start the scan loop, the config watcher, and the HTTP server.
 
-Between the priming scan and the second scan, `/metrics` returns gauges with zero counters. `process_exporter_scans_total` reading 1 tells an operator this is why.
+Between the priming scan and the second scan, `/metrics` shows gauges with zero counters. `process_exporter_scans_total` reading 1 tells an operator why, and `/readyz` returns 503.
 
-## 11.2 Steady state
+## 12.2 Shutdown
 
-Every `interval`, one scan runs to completion and swaps the snapshot pointer. Scrapes read the current pointer with no lock contention against the scanner.
+`SIGINT` or `SIGTERM`. The HTTP server stops accepting, the scanner finishes its current batch and exits, all goroutines are awaited.
 
-## 11.3 Shutdown
+**No state is persisted.** A restart resets every counter and Prometheus sees a reset. This is correct and expected for a process exporter, matching `node_exporter` and every other agent of this class. `rate()` handles it.
 
-`SIGINT` or `SIGTERM`. HTTP server stops accepting, in-flight scrapes complete, the scanner finishes its current batch and exits. No state is persisted — the exporter rebuilds from a priming scan on the next start.
-
-The consequence of not persisting: a restart resets every counter, and Prometheus sees a counter reset across the restart. This is correct and expected behaviour for a process exporter, matching `node_exporter` and every other agent of this kind. `rate()` handles it.
-
-## 11.4 Failure modes
+## 12.3 Failure modes
 
 | Symptom | Cause | Diagnostic |
 |---|---|---|
-| No counter values | Only one scan has run | `process_exporter_scans_total` |
-| I/O metrics all zero | Not root; `io` unreadable | `process_group_io_coverage_ratio` |
-| fd metrics missing | Not root, or `fd_scan_every` not yet reached | `process_group_fd_coverage_ratio` |
-| Group count growing without bound | A naming rule extracts an unbounded value | `process_exporter_groups_total` trend |
+| All counters zero | Only one scan has run | `process_exporter_scans_total` |
+| I/O metrics absent | Not root; `io` unreadable | `process_group_io_coverage_ratio` |
+| fd metrics absent | Not root, or `fd_scan_every` not yet reached | `process_group_fd_coverage_ratio` |
+| Group count growing steadily | A naming rule extracts an unbounded value | Gap between `groups_total` and `names_seen_total` |
 | High exporter CPU | `batch_sleep` too short or `interval` too short | `process_exporter_scan_cpu_seconds_total` |
-| Stale metrics | Scans overrunning the interval | `process_exporter_scan_overruns_total` |
+| Stale metrics | Scans overrunning | `process_exporter_scan_overruns_total` |
 | Many processes ignored | Filter too broad | `process_exporter_procs_ignored` |
-| RSS sum exceeds physical memory | Shared pages counted per member | Expected; see 8.1 |
+| RSS exceeds physical memory | Shared pages counted per member | Expected; see 8.1 |
+| Truncated names like `process_exporte` | `comm` is 15 characters | Expected; add a naming rule if it matters |
 
 ---
 
-# Part 12 — Prometheus usage
+# Part 13 — Prometheus usage
 
-## 12.1 Scrape
+## 13.1 Scrape
 
 ```yaml
 scrape_configs:
@@ -960,53 +936,37 @@ scrape_configs:
       - targets: ['host:9256']
 ```
 
-Scrape interval should be at or above `scan.interval`. Scraping faster than scanning returns the same snapshot repeatedly, which is harmless but pointless.
+Scrape interval should be at or above `scan.interval`. Scraping faster returns the same snapshot repeatedly, which is harmless but pointless.
 
-## 12.2 Queries
+## 13.2 Queries
 
-**CPU by group:**
 ```promql
-topk(10,
-  sum by (name, user) (rate(process_group_cpu_seconds_total[5m]))
-)
-```
+# CPU by group
+topk(10, sum by (name, user) (rate(process_group_cpu_seconds_total[5m])))
 
-**Memory by group:**
-```promql
+# Memory by group
 topk(10, process_group_memory_rss_bytes)
-```
 
-**Descriptor pressure:**
-```promql
+# Descriptor pressure
 process_group_open_fds / process_group_max_fds > 0.8
-```
 
-**Process count change, catching leaks or crash loops:**
-```promql
+# Process count change: leaks or crash loops
 delta(process_group_num_procs[1h]) != 0
-```
 
-**Group restarted:**
-```promql
+# Group restarted
 changes(process_group_oldest_start_time_seconds[1h]) > 0
-```
 
-**Blocked on I/O:**
-```promql
-process_group_states{state="D"} > 0
-```
+# Blocked on I/O
+process_group_states{state="disk_sleep"} > 0
 
-**Zombies:**
-```promql
-process_group_states{state="Z"} > 5
-```
+# Zombies
+process_group_states{state="zombie"} > 5
 
-**Exporter cost, the self-check:**
-```promql
+# The self-check
 rate(process_exporter_scan_cpu_seconds_total[5m])
 ```
 
-## 12.3 Alerting
+## 13.3 Alerting
 
 ```yaml
 groups:
@@ -1015,67 +975,81 @@ groups:
       - alert: ProcessGroupFDExhaustion
         expr: process_group_open_fds / process_group_max_fds > 0.9
         for: 5m
-        annotations:
-          summary: "{{ $labels.name }} ({{ $labels.user }}) near its fd limit"
 
       - alert: ProcessGroupGone
         expr: process_group_num_procs == 0
         for: 5m
-        annotations:
-          summary: "{{ $labels.name }} has no running processes"
-
-      - alert: ProcessGroupZombies
-        expr: process_group_states{state="Z"} > 10
-        for: 10m
 
       - alert: ProcessExporterExpensive
         expr: rate(process_exporter_scan_cpu_seconds_total[5m]) > 0.05
         for: 15m
         annotations:
-          summary: "process_exporter using over 5% of a core; check scan tuning"
+          summary: "over 5% of a core; check scan tuning"
 
       - alert: ProcessExporterStale
         expr: time() - process_exporter_last_scan_timestamp_seconds > 120
         for: 5m
 
       - alert: ProcessExporterCardinality
-        expr: process_exporter_groups_total > 500
+        expr: |
+          process_exporter_group_names_seen_total
+            - process_exporter_groups_total > 200
         for: 30m
         annotations:
-          summary: "{{ $value }} groups; check naming rules for unbounded extraction"
+          summary: "name churn; a naming rule is extracting an unbounded value"
 ```
 
 ---
 
-# Part 13 — Design decisions recorded
+# Part 14 — Design decisions recorded
 
 | Decision | Choice | Reason |
 |---|---|---|
 | Key | Name plus user, no PID | PID is unbounded; name is bounded by software inventory; user separates masters from workers |
-| Cardinality cap | None | Per your instruction. The ignore list is the control |
-| Counter model | Per-group accumulator fed by per-PID deltas | Summing lifetime totals drops on process exit and Prometheus sees a reset |
-| PID reuse defence | Start time validation plus negative-delta clamp | Two independent checks |
-| State pruning | Generation stamp | Map size tracks live processes, not historical ones |
-| Accumulator pruning | `group_retention`, default 1h | A restarting service resumes its counter instead of resetting |
+| Cardinality cap | None | The ignore list and naming rules are the control |
+| Counter model | Per-group accumulator fed by per-PID deltas | Summing lifetime totals drops on exit and reads as a reset |
+| PID reuse defence | Start time validation plus zero clamp | Two independent checks |
+| State pruning | Generation stamp | Map size tracks live processes, not history |
+| Accumulator pruning | `group_retention`, default 1h | A restarting service resumes its counter |
 | Scan model | Own timer; scrapes read a snapshot | Cost independent of scrape count and frequency |
 | Yield model | Batch plus sleep | Keeps the scheduler from treating the exporter as CPU-bound |
-| fd frequency | Every Nth scan | Directory walk is the dominant cost and fd counts change slowly |
-| cmdline caching | Cached per PID | Immutable in practice; removes one read per process per scan |
+| fd frequency | Every Nth scan, cached between | Directory walk dominates; caching stops the gauge dropping |
+| Name caching | Per PID, keyed on start time | Removes a read and an evaluation per process per scan |
 | Kernel threads | Ignored by default | No address space, meaningless memory, unbounded names |
-| Privilege | Whatever it was given | Complete CPU and memory regardless; I/O and fd coverage reported as a ratio |
-| Threads | Count only, no per-thread | Per-thread would multiply cardinality for little gain |
-| RSS sharing | Not corrected | `smaps` is too expensive; `DataBytes` published alongside as the closer figure |
-| Persistence | None | Restart resets counters; correct and expected for this class of agent |
+| Privilege | Whatever it was given | CPU and memory always complete; io and fd coverage reported as a ratio |
+| Absent data | Metric omitted, not zeroed | Zero and unknown are different facts |
+| Threads | Count only | Per-thread would multiply cardinality for little gain |
+| RSS sharing | Not corrected | `smaps` defeats the low-CPU requirement; `DataBytes` published alongside |
+| Metrics implementation | `prometheus.Collector` | A vanished group stops being collected with no explicit cleanup |
+| Persistence | None | Restart resets counters; correct for this class of agent |
+| Readiness | Two scans | Counters do not exist until the second scan |
 
 ---
 
-# Part 14 — Open items for your confirmation
+# Part 15 — Reading the code
 
-1. **Metric prefix.** `process_group_*` for the data, `process_exporter_*` for self-metrics. Confirm or rename.
-2. **Default port.** 9256 is the Prometheus registry allocation for the existing `process-exporter`. Reusing it eases migration but collides if both run. Confirm 9256, or pick another.
-3. **`OldestStart` aggregation.** Minimum gives group age. An alternative is maximum, giving "most recently restarted". I chose minimum; say if you want both.
-4. **`MaxFDs` aggregation.** Summed, so `open/max` is a meaningful group ratio. The alternative is minimum, giving the tightest individual limit. Summed is more useful for a group; confirm.
-5. **`include_only`.** Included as an inverse of the ignore list, for the case where you want a small named set only. Say if you want it removed.
-6. **Container awareness.** The current design has none — a containerised process is named by its binary like any other. Adding cgroup or container-name labels is possible but multiplies cardinality by the container count and needs a decision.
+Suggested order:
 
-Confirm these six and correct anything above, and I will produce the implementation turn plan and the complete function and struct surface, as with the mesh system.
+1. **`internal/scan/state.go`** — `PIDState` and `StateMap`. The generation stamp and the start-time check are the whole basis of correct counters. Short file.
+2. **`internal/scan/scan.go`** — `readProcess`. Read the order of operations: which files are read, when the filter is applied, and where the name cache short-circuits.
+3. **`internal/aggregate/aggregate.go`** — `Apply` and `accumulate`. The accumulator is what keeps counters monotonic.
+4. **`internal/namer/namer.go`** — `Name` and the fall-through cascade.
+5. **`internal/metrics/metrics.go`** — `groupCollector.Collect`. Note which metrics are conditionally emitted.
+6. **`cmd/process_exporter/main.go`** — the scan loop and overrun handling.
+
+The `internal/procfs` package is a set of independent parsers and can be read in any order or skipped.
+
+---
+
+# Part 16 — Known limitations
+
+| Item | Status |
+|---|---|
+| RSS over-counting | Shared pages counted per member. `smaps` would fix it at a cost this design cannot pay |
+| argv rewriting | A process changing its own argv keeps its cached name until restart. Set `cache_cmdline: false` to disable |
+| `comm` truncation | Fifteen characters, kernel-imposed. Naming rules are the workaround |
+| Container awareness | None. A containerised process is named by its binary like any other |
+| Per-thread data | Not collected. Thread count only |
+| Counter persistence | None. Restart resets every counter |
+| `getconf` dependency | `clockTicks()` shells out once at start; falls back to 100 |
+| Cgroup metrics | Not collected. `cadvisor` is the right tool |
