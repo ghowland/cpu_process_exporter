@@ -1,0 +1,103 @@
+# process_exporter configuration.
+#
+# Every process is grouped by name and owning user. No PID appears in
+# any label, because a PID label would create a new series on every
+# process start and the series count would be driven by workload churn
+# rather than by anything the operator chose.
+
+scan:
+  # Time between scan starts. Counter rates are computed from the
+  # difference between consecutive scans, so this is also the sampling
+  # resolution.
+  interval: 15s
+
+  # Processes read between yields. The scan sleeps for batch_sleep after
+  # each batch, which is what stops the scheduler treating the exporter
+  # as a CPU-bound task and keeps it off the top of the process list.
+  batch_size: 50
+  batch_sleep: 5ms
+
+  # Enumerating /proc/<pid>/fd requires the kernel to walk the file
+  # descriptor table, which is the dominant cost in the whole scan.
+  # Descriptor counts change slowly, so a refresh every fourth scan is
+  # adequate while CPU needs every scan.
+  fd_scan_every: 4
+
+  # /proc/<pid>/io needs a matching UID or CAP_SYS_PTRACE. An
+  # unprivileged exporter simply gets partial coverage, reported through
+  # process_group_io_coverage_ratio, rather than an error.
+  read_io: true
+
+  # /proc/<pid>/status supplies the UID and the context switch counters.
+  read_status: true
+
+  # A process's command line, executable, and UID do not change for its
+  # lifetime, so the derived group name is cached per PID. This removes
+  # one read and one namer evaluation per process per scan. The cost is
+  # that a process which rewrites its own argv keeps its original name
+  # until it restarts.
+  cache_cmdline: true
+
+  # A group whose processes all exit keeps its counter accumulator for
+  # this long, so a service restarting does not reset its counters.
+  group_retention: 1h
+
+  proc_path: /proc
+
+filter:
+  # Kernel threads have no address space of their own, so their memory
+  # readings are meaningless, and their names are numerous and
+  # machine-specific, which makes them a cardinality problem as well as
+  # a noise problem.
+  ignore_kernel_threads: true
+
+  # Leave ignore_comm, ignore_comm_prefix, and ignore_comm_regex unset
+  # to get the shipped defaults, which cover the standard Linux kernel
+  # threads and driver helpers. Set them to an empty list to disable the
+  # defaults entirely.
+
+  # Matching against the command line requires reading it for every
+  # process, so a configuration using this rule pays for one extra read
+  # per process per scan.
+  ignore_cmdline_regex: []
+
+  ignore_users: []
+
+  # When set, a process must match one of these before any other rule is
+  # considered. Useful when only a named set of services matters.
+  include_only: []
+
+naming:
+  # Used when no rule matches. comm is the kernel short name, truncated
+  # to fifteen characters.
+  fallback: comm
+
+  # Resolve UIDs to names. When false, the user label is uid:NNNN, which
+  # saves the lookup and avoids passwd churn.
+  resolve_users: true
+
+  # Leave rules unset for the shipped defaults, which handle the
+  # interpreter cases where comm is the interpreter rather than the
+  # service: java, python, node, ruby, and the container shims.
+  #
+  # These rules are the cardinality control. A rule extracting a PID, a
+  # UUID, a port, or a container ID creates one series per process
+  # instance and defeats the point of grouping. Watch
+  # process_exporter_group_names_seen_total against
+  # process_exporter_groups_total; a widening gap means a rule is
+  # extracting an unbounded value.
+  #
+  # rules:
+  #   - match_comm: java
+  #     from: cmdline
+  #     regex: '-Dservice=(\S+)'
+  #     name: 'java/$1'
+
+server:
+  listen: "0.0.0.0:9256"
+  metrics_path: /metrics
+
+log:
+  level: info
+  format: json
+
