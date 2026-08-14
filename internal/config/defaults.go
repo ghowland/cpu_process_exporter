@@ -145,10 +145,10 @@ var DefaultNamingRules = []NamingRule{
 func Default() Config {
 	return Config{
 		Scan: ScanConfig{
-			Interval:       Duration(15 * time.Second),
+			Interval:       Duration(5 * time.Second),
 			BatchSize:      50,
-			BatchSleep:     Duration(5 * time.Millisecond),
-			FDScanEvery:    4,
+			BatchSleep:     Duration(4 * time.Millisecond),
+			FDScanEvery:    12,
 			ReadIO:         true,
 			ReadStatus:     true,
 			CacheCmdline:   true,
@@ -179,4 +179,3 @@ func Default() Config {
 		},
 	}
 }
-

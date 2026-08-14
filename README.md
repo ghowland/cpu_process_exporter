@@ -11,7 +11,9 @@ process_group_num_procs{name="nginx",user="root"} 1
 
 Linux only. Two dependencies. Under 3,000 lines of Go.
 
----
+## Why It's Fast
+
+![Diagram](process_exporter.png)
 
 ## Why
 

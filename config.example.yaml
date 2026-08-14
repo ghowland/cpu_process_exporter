@@ -9,19 +9,19 @@ scan:
   # Time between scan starts. Counter rates are computed from the
   # difference between consecutive scans, so this is also the sampling
   # resolution.
-  interval: 15s
+  interval: 5s
 
   # Processes read between yields. The scan sleeps for batch_sleep after
   # each batch, which is what stops the scheduler treating the exporter
   # as a CPU-bound task and keeps it off the top of the process list.
   batch_size: 50
-  batch_sleep: 5ms
+  batch_sleep: 4ms
 
   # Enumerating /proc/<pid>/fd requires the kernel to walk the file
   # descriptor table, which is the dominant cost in the whole scan.
   # Descriptor counts change slowly, so a refresh every fourth scan is
   # adequate while CPU needs every scan.
-  fd_scan_every: 4
+  fd_scan_every: 12
 
   # /proc/<pid>/io needs a matching UID or CAP_SYS_PTRACE. An
   # unprivileged exporter simply gets partial coverage, reported through
