@@ -13,7 +13,7 @@ Linux only. Two dependencies. Under 3,000 lines of Go.
 
 ## Why It's Fast
 
-![Diagram](process_exporter.png)
+![Diagram](docs/process_exporter.png)
 
 ## Why
 
