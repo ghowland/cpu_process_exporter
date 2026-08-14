@@ -23,7 +23,23 @@ scan:
   # adequate while CPU needs every scan.
   fd_scan_every: 12
 
+  # Proportional set size, from /proc/<pid>/smaps_rollup. This is the
+  # only correct group memory figure: resident set size counts each
+  # shared page once per member, so forty nginx workers sharing the
+  # same text sum to far more than they actually occupy, and the total
+  # can exceed physical memory. PSS divides each shared page by the
+  # number of processes sharing it, so the group sum is accurate.
+  #
+  # The read walks page tables and costs about as much as the
+  # descriptor directory walk, so it runs on its own schedule. Set
+  # read_smaps to false on a machine running processes with hundreds of
+  # memory mappings, such as large JVMs, on a kernel older than 4.14
+  # where the cheaper smaps_rollup is unavailable.
+  read_smaps: true
+  smaps_scan_every: 12
+
   # /proc/<pid>/io needs a matching UID or CAP_SYS_PTRACE. An
+
   # unprivileged exporter simply gets partial coverage, reported through
   # process_group_io_coverage_ratio, rather than an error.
   read_io: true

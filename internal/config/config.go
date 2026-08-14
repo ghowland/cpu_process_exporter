@@ -74,10 +74,20 @@ type Config struct {
 // off the top of the process list: the scan yields between batches so
 // the scheduler does not treat it as a CPU-bound task.
 type ScanConfig struct {
-	Interval       Duration `yaml:"interval"        json:"interval"`
-	BatchSize      int      `yaml:"batch_size"      json:"batch_size"`
-	BatchSleep     Duration `yaml:"batch_sleep"     json:"batch_sleep"`
-	FDScanEvery    int      `yaml:"fd_scan_every"   json:"fd_scan_every"`
+	Interval    Duration `yaml:"interval"        json:"interval"`
+	BatchSize   int      `yaml:"batch_size"      json:"batch_size"`
+	BatchSleep  Duration `yaml:"batch_sleep"     json:"batch_sleep"`
+	FDScanEvery int      `yaml:"fd_scan_every"   json:"fd_scan_every"`
+
+	// ReadSmaps collects proportional set size, which is the only
+	// correct group memory footprint. Resident set size counts each
+	// shared page once per member, so a group sum over-counts.
+	//
+	// The read walks page tables and is comparable in cost to the
+	// descriptor directory walk, so it runs on its own schedule.
+	ReadSmaps      bool `yaml:"read_smaps"       json:"read_smaps"`
+	SmapsScanEvery int  `yaml:"smaps_scan_every" json:"smaps_scan_every"`
+
 	ReadIO         bool     `yaml:"read_io"         json:"read_io"`
 	ReadStatus     bool     `yaml:"read_status"     json:"read_status"`
 	CacheCmdline   bool     `yaml:"cache_cmdline"   json:"cache_cmdline"`
@@ -139,4 +149,3 @@ type LogConfig struct {
 	Level  string `yaml:"level"  json:"level"`
 	Format string `yaml:"format" json:"format"`
 }
-

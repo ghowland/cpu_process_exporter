@@ -27,14 +27,27 @@ type Process struct {
 	StartTicks uint64
 	StartUnix  float64
 
-	// Gauges, read fresh each scan
+	// Gauges
 	RSSBytes    uint64
 	VSizeBytes  uint64
 	SharedBytes uint64
 	DataBytes   uint64
+	SwapBytes   uint64
 	Threads     int
 	OpenFDs     int
 	MaxFDs      int
+
+	// FDRatio is open descriptors over the soft limit for this one
+	// process. It is computed here, before aggregation, so the group
+	// can take the maximum. A ratio of group sums cannot detect a
+	// single member near its limit.
+	FDRatio float64
+
+	// Proportional set size. Unlike resident set size, a group sum of
+	// these is the true physical footprint, because each shared page
+	// is divided by the number of processes sharing it.
+	PSSBytes     uint64
+	SwapPSSBytes uint64
 
 	// Counter deltas for this scan, already differenced against state
 	DUTimeTicks  uint64
@@ -53,6 +66,7 @@ type Process struct {
 	HaveIO     bool
 	HaveFDs    bool
 	HaveStatus bool
+	HavePSS    bool
 }
 
 // Result is the outcome of one scan.
@@ -137,6 +151,7 @@ func (s *Scanner) Scan(ctx context.Context) (*Result, error) {
 	}
 
 	doFDs := s.shouldScanFDs(cfg)
+	doSmaps := s.shouldScanSmaps(cfg)
 	batch := cfg.Scan.BatchSize
 	if batch < 1 {
 		batch = 1
@@ -152,7 +167,7 @@ func (s *Scanner) Scan(ctx context.Context) (*Result, error) {
 			end = len(pids)
 		}
 		for _, pid := range pids[i:end] {
-			if p := s.readProcess(pid, cfg, f, n, doFDs, res); p != nil {
+			if p := s.readProcess(pid, cfg, f, n, doFDs, doSmaps, res); p != nil {
 				res.Procs = append(res.Procs, *p)
 				res.Scanned++
 			}
@@ -182,6 +197,7 @@ func (s *Scanner) Scan(ctx context.Context) (*Result, error) {
 		"vanished", res.Vanished,
 		"denied", res.Denied,
 		"fd_scan", doFDs,
+		"smaps_scan", doSmaps,
 		"self_cpu_ms", res.SelfCPU*1000)
 
 	return res, nil
@@ -190,8 +206,7 @@ func (s *Scanner) Scan(ctx context.Context) (*Result, error) {
 // readProcess assembles one process. It returns nil when the process
 // should be skipped, which covers both vanishing and being ignored.
 func (s *Scanner) readProcess(pid int, cfg *config.Config, f *filter.Filter,
-	n *namer.Namer, doFDs bool, res *Result) *Process {
-
+	n *namer.Namer, doFDs, doSmaps bool, res *Result) *Process {
 	procPath := cfg.Scan.ProcPath
 
 	// stat is read first and unconditionally. It is the cheapest read
@@ -315,6 +330,9 @@ func (s *Scanner) readProcess(pid int, cfg *config.Config, f *filter.Filter,
 		MaxFDs:     -1,
 		HaveStatus: haveStatus,
 	}
+	if haveStatus {
+		p.SwapBytes = status.SwapBytes
+	}
 
 	// statm supersedes the RSS figure from stat and adds the shared and
 	// private-writable breakdown, which is the closer approximation to
@@ -358,6 +376,14 @@ func (s *Scanner) readProcess(pid int, cfg *config.Config, f *filter.Filter,
 			if max, err := procfs.MaxFDs(procPath, pid); err == nil {
 				p.MaxFDs = max
 			}
+			// The ratio is computed here, per process, so that the
+			// group can take the maximum rather than dividing one sum
+			// by another. A limit of unlimited reads as -1 and
+			// contributes no ratio, because nothing can be near a
+			// limit that does not exist.
+			if p.MaxFDs > 0 {
+				p.FDRatio = float64(p.OpenFDs) / float64(p.MaxFDs)
+			}
 		} else if procfs.IsVanished(err) {
 			res.Vanished++
 			return nil
@@ -367,22 +393,49 @@ func (s *Scanner) readProcess(pid int, cfg *config.Config, f *filter.Filter,
 	} else if havePrev && prev.HaveFDs {
 		p.OpenFDs = prev.OpenFDs
 		p.MaxFDs = prev.MaxFDs
+		p.FDRatio = prev.FDRatio
 		p.HaveFDs = true
+	}
+
+	// Proportional set size runs on its own schedule for the same
+	// reason as the descriptor walk: it is expensive relative to a
+	// stat read, and memory footprint changes slowly.
+	if cfg.Scan.ReadSmaps {
+		if doSmaps {
+			if sm, err := procfs.ReadSmaps(procPath, pid, s.deps.System.SmapsRollup); err == nil {
+				p.PSSBytes = sm.PSSBytes
+				p.SwapPSSBytes = sm.SwapPSSBytes
+				p.HavePSS = true
+			} else if procfs.IsVanished(err) {
+				res.Vanished++
+				return nil
+			} else if !procfs.IsDenied(err) {
+				res.ReadErrs["smaps"]++
+			}
+		} else if havePrev && prev.HavePSS {
+			p.PSSBytes = prev.PSSBytes
+			p.SwapPSSBytes = prev.SwapPSSBytes
+			p.HavePSS = true
+		}
 	}
 
 	// Assemble the new state, then difference it against the old.
 	cur := &PIDState{
-		StartTicks:  st.StartTicks,
-		UTimeTicks:  st.UTimeTicks,
-		STimeTicks:  st.STimeTicks,
-		MinorFaults: st.MinorFaults,
-		MajorFaults: st.MajorFaults,
-		Name:        name,
-		User:        userName,
-		UID:         uid,
-		OpenFDs:     p.OpenFDs,
-		MaxFDs:      p.MaxFDs,
-		HaveFDs:     p.HaveFDs,
+		StartTicks:   st.StartTicks,
+		UTimeTicks:   st.UTimeTicks,
+		STimeTicks:   st.STimeTicks,
+		MinorFaults:  st.MinorFaults,
+		MajorFaults:  st.MajorFaults,
+		Name:         name,
+		User:         userName,
+		UID:          uid,
+		OpenFDs:      p.OpenFDs,
+		MaxFDs:       p.MaxFDs,
+		FDRatio:      p.FDRatio,
+		HaveFDs:      p.HaveFDs,
+		PSSBytes:     p.PSSBytes,
+		SwapPSSBytes: p.SwapPSSBytes,
+		HavePSS:      p.HavePSS,
 	}
 	if haveStatus {
 		cur.VolCtxSw = status.VolCtxSw
@@ -433,6 +486,27 @@ func (s *Scanner) shouldScanFDs(cfg *config.Config) bool {
 	return s.scanNo%uint64(every) == 1 || s.scanNo == 1
 }
 
+// shouldScanSmaps reports whether this scan reads proportional memory.
+//
+// The read walks page tables and is comparable in cost to the
+// descriptor directory walk. Memory footprint changes slowly, so a
+// refresh once a minute is adequate. The offset by one against the fd
+// schedule keeps the two expensive reads on different scans rather
+// than stacking them.
+func (s *Scanner) shouldScanSmaps(cfg *config.Config) bool {
+	if !cfg.Scan.ReadSmaps {
+		return false
+	}
+	every := cfg.Scan.SmapsScanEvery
+	if every <= 1 {
+		return true
+	}
+	if s.scanNo == 1 {
+		return true
+	}
+	return s.scanNo%uint64(every) == uint64(every/2)
+}
+
 // selfCPU returns the CPU seconds this exporter process has consumed,
 // user plus system.
 //
@@ -470,4 +544,3 @@ func itoa(n int) string {
 
 // keep runtime referenced for GOMAXPROCS-aware tuning notes in logs.
 var _ = runtime.NumCPU
-

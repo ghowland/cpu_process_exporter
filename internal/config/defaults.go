@@ -149,6 +149,8 @@ func Default() Config {
 			BatchSize:      50,
 			BatchSleep:     Duration(4 * time.Millisecond),
 			FDScanEvery:    12,
+			ReadSmaps:      true,
+			SmapsScanEvery: 12,
 			ReadIO:         true,
 			ReadStatus:     true,
 			CacheCmdline:   true,

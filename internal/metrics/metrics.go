@@ -32,8 +32,26 @@ var (
 	descShared = prometheus.NewDesc("process_group_memory_shared_bytes",
 		"Resident shared pages summed across the group.", groupLabels, nil)
 	descData = prometheus.NewDesc("process_group_memory_data_bytes",
-		"Private writable pages summed across the group, the closest "+
-			"available figure for unshared memory.", groupLabels, nil)
+		"Private writable pages summed across the group. A useful leak "+
+			"indicator, but not an approximation of PSS: it excludes text "+
+			"and shared segments.", groupLabels, nil)
+	descPSS = prometheus.NewDesc("process_group_memory_pss_bytes",
+		"Proportional set size summed across the group. Each shared page "+
+			"is divided by the number of processes sharing it, so this sum "+
+			"is the true physical footprint. Use this rather than RSS for "+
+			"any comparison against total memory.", groupLabels, nil)
+	descSwapPSS = prometheus.NewDesc("process_group_memory_swap_pss_bytes",
+		"Proportional swap summed across the group.", groupLabels, nil)
+	descSwap = prometheus.NewDesc("process_group_memory_swap_bytes",
+		"Swapped memory summed across the group, from VmSwap.", groupLabels, nil)
+	descPSSCoverage = prometheus.NewDesc("process_group_pss_coverage_ratio",
+		"Fraction of members whose smaps was readable. Below one means the "+
+			"PSS total is a lower bound.", groupLabels, nil)
+	descWorstFD = prometheus.NewDesc("process_group_worst_fd_ratio",
+		"Highest open descriptors over limit across the members, taken per "+
+			"process before aggregation. A ratio of the group sums cannot "+
+			"detect one member near its limit; alert on this instead.",
+		groupLabels, nil)
 	descOpenFDs = prometheus.NewDesc("process_group_open_fds",
 		"Open file descriptors summed across the group.", groupLabels, nil)
 	descMaxFDs = prometheus.NewDesc("process_group_max_fds",
@@ -228,8 +246,13 @@ func (c *groupCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- descVSize
 	ch <- descShared
 	ch <- descData
+	ch <- descPSS
+	ch <- descSwapPSS
+	ch <- descSwap
+	ch <- descPSSCoverage
 	ch <- descOpenFDs
 	ch <- descMaxFDs
+	ch <- descWorstFD
 	ch <- descOldestStart
 	ch <- descStates
 	ch <- descFDCoverage
@@ -266,7 +289,17 @@ func (c *groupCollector) Collect(ch chan<- prometheus.Metric) {
 		g(descVSize, float64(s.VSizeBytes), n, u)
 		g(descShared, float64(s.SharedBytes), n, u)
 		g(descData, float64(s.DataBytes), n, u)
+		g(descSwap, float64(s.SwapBytes), n, u)
 		g(descOldestStart, s.OldestStart, n, u)
+		g(descPSSCoverage, s.PSSCoverage(), n, u)
+
+		// Omitted rather than zeroed when nothing was readable, so
+		// that "no proportional data" and "no memory" cannot be
+		// mistaken for each other.
+		if s.PSSRead > 0 {
+			g(descPSS, float64(s.PSSBytes), n, u)
+			g(descSwapPSS, float64(s.SwapPSSBytes), n, u)
+		}
 		g(descFDCoverage, s.FDCoverage(), n, u)
 		g(descIOCoverage, s.IOCoverage(), n, u)
 
@@ -277,6 +310,7 @@ func (c *groupCollector) Collect(ch chan<- prometheus.Metric) {
 			g(descOpenFDs, float64(s.OpenFDs), n, u)
 			if s.MaxFDs > 0 {
 				g(descMaxFDs, float64(s.MaxFDs), n, u)
+				g(descWorstFD, s.WorstFDRatio, n, u)
 			}
 		}
 
@@ -300,4 +334,3 @@ func (c *groupCollector) Collect(ch chan<- prometheus.Metric) {
 
 // keep time referenced for the duration observation above.
 var _ = time.Second
-

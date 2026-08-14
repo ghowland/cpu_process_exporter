@@ -109,6 +109,9 @@ func (c *Config) Validate() error {
 	if s.FDScanEvery < 1 {
 		add("scan.fd_scan_every must be at least 1")
 	}
+	if s.SmapsScanEvery < 1 {
+		add("scan.smaps_scan_every must be at least 1")
+	}
 	if s.GroupRetention.D() < 0 {
 		add("scan.group_retention must not be negative")
 	}
@@ -228,4 +231,3 @@ func (c *Config) NamingChanged(o *Config) bool {
 	}
 	return !reflect.DeepEqual(c.Naming, o.Naming)
 }
-

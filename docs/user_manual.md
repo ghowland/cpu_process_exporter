@@ -290,19 +290,26 @@ naming:
 
 That reads `/proc/<pid>/exe` for uncached processes, which costs one readlink per new process. With `cache_cmdline: true` this is paid once per process lifetime, not once per scan.
 
-## 3.4 The RSS caveat, stated plainly
+## 3.4 Which memory metric to use
 
 **A group's RSS total can exceed the machine's physical memory.** This is an artefact of summation, not a bug.
 
 Forty nginx workers each showing 50 MB resident sum to 2 GB, but most of those pages are the same physical pages shared between them. The true footprint might be 200 MB.
 
-Three responses, in order of usefulness:
+Four memory metrics are published, and they are different quantities:
 
-1. **Use `process_group_memory_data_bytes` instead.** Private writable pages are not shared between forked processes, so the sum is closer to real unshared memory.
-2. **Compare groups against each other**, not against `node_memory_MemTotal_bytes`. The relative sizes are meaningful even when the absolutes are inflated.
-3. **Watch the trend, not the value.** A group whose RSS doubles has doubled its footprint, whatever the absolute over-count.
+| Metric | What it measures | Group sum is |
+|---|---|---|
+| `memory_pss_bytes` | Every resident page, each shared page divided by the number of processes sharing it | **Correct** |
+| `memory_rss_bytes` | Every resident page, counted in full for each process | Over-counts |
+| `memory_data_bytes` | Private writable pages only | Under-counts |
+| `memory_shared_bytes` | Resident shared pages | Diagnostic only |
 
-Computing proportional set size would require reading `/proc/<pid>/smaps`, which is expensive enough to defeat the low-CPU requirement this exporter exists to meet. That trade was made deliberately.
+**Use `process_group_memory_pss_bytes`** for anything that needs a real number, including any comparison against `node_memory_MemTotal_bytes`. Enabled by default via `read_smaps`.
+
+`memory_data_bytes` is **not** an approximation of PSS. It is private writable memory: it excludes text and shared segments entirely, where RSS double-counts them. Neither reliably brackets the true figure. It remains useful as a heap leak indicator, because a leak lands in private writable memory, but do not substitute it for PSS.
+
+Check coverage before trusting a PSS figure:
 
 ## 3.5 Absent metrics versus zero
 
@@ -326,15 +333,18 @@ Always check the coverage ratio before concluding a group is idle.
 
 ```yaml
 scan:
-  interval: 15s
+  interval: 5s
   batch_size: 50
-  batch_sleep: 5ms
-  fd_scan_every: 4
+  batch_sleep: 4ms
+  fd_scan_every: 12
+  read_smaps: true
+  smaps_scan_every: 12
   read_io: true
   read_status: true
   cache_cmdline: true
   group_retention: 1h
   proc_path: /proc
+
 
 filter:
   ignore_kernel_threads: true
@@ -361,23 +371,26 @@ log:
 
 ## 4.1 `scan` section
 
-### `interval` — default 15s
+### `interval` — default 5s
 
 Time between scan starts. This is also the **sampling resolution for every counter**, because rates are computed from the difference between consecutive scans.
 
 | Value | Effect |
 |---|---|
-| 5s | Fine resolution, roughly 3× the CPU of the default |
-| 15s | Default. Adequate for almost everything |
-| 60s | Coarse; a CPU spike lasting 30 seconds may be averaged away |
+| 1s | Best capture. Viable under a few hundred processes |
+| 5s | Default. The slowest interval that captures anything useful |
+| 15s | A spike lasting 30 seconds is smoothed into near-invisibility |
+| 60s | Trend data only |
 
-A shorter interval does not make any individual reading more accurate. It makes short-lived events visible that a longer interval would smooth over.
+A shorter interval does not make any individual reading more accurate. It makes short-lived events visible that a longer interval would smooth over — and that is usually the whole reason you are looking.
+
+At 15 seconds, a process that burns a core for half that time contributes one sample and the rate calculation averages it away. Five seconds is the point at which such an event produces two or three samples and becomes visible. One second resolves its shape.
 
 ### `batch_size` — default 50
 
 Processes read between yields. Combined with `batch_sleep`, this is what keeps the exporter off the top of `top`.
 
-### `batch_sleep` — default 5ms
+### `batch_sleep` — default 4ms
 
 Sleep duration after each batch.
 
@@ -389,31 +402,55 @@ Scan duration is approximately:
 duration ≈ (procs ÷ batch_size) × batch_sleep + procs × read_cost
 ```
 
-With 2,000 processes, batch 50, sleep 5ms:
+With 2,000 processes, batch 50, sleep 4ms:
 
-- Sleeping: `(2000 ÷ 50) × 5ms = 200ms`
+- Sleeping: `(2000 ÷ 50) × 4ms = 160ms`
 - Reading: roughly 40 to 100ms
-- **Total: 250 to 300ms out of a 15-second interval**
+- **Total: 200 to 260ms out of a 5-second interval**
 
-CPU share: about `100ms ÷ 15s ≈ 0.7%` of one core.
+CPU share: about `100ms ÷ 5s ≈ 2%` of one core on a busy machine, and well under 1% on a machine of a few hundred processes.
 
-### `fd_scan_every` — default 4
+The sleep is shorter than it would be at a 15-second interval, because a shorter interval leaves less room for the scan to spread out in.
+
+### `fd_scan_every` — default 12
 
 Read `/proc/<pid>/fd/` every Nth scan.
 
-**Descriptor counting is the dominant cost in the entire scan.** The kernel must walk the file descriptor table and produce a directory entry for each open descriptor. A process holding ten thousand descriptors costs more than a hundred `stat` reads.
+**Descriptor counting is one of the two dominant costs in the scan.** The kernel must walk the file descriptor table and produce a directory entry for each open descriptor. A process holding ten thousand descriptors costs more than a hundred `stat` reads.
 
-Descriptor counts change slowly. At the default `interval: 15s` and `fd_scan_every: 4`, they refresh once per minute, which is adequate for detecting a leak long before it exhausts a limit.
+Descriptor counts change slowly. At the default `interval: 5s` and `fd_scan_every: 12`, they refresh once per minute, which is adequate for detecting a leak long before it exhausts a limit.
 
-**Between fd scans the cached value is reported.** Without this the gauge would drop to zero on three scans out of four, which would look like every process closing all its files.
+**Between fd scans the cached value is reported.** Without this the gauge would drop to zero on eleven scans out of twelve, which would look like every process closing all its files.
 
-| Value | Refresh at 15s interval | Cost |
+| Value | Refresh at 5s interval | Cost |
 |---|---|---|
-| 1 | Every 15s | Highest |
-| 4 | Every 60s | Default |
-| 20 | Every 5 minutes | Lowest |
+| 1 | Every 5s | Highest |
+| 12 | Every 60s | Default |
+| 60 | Every 5 minutes | Lowest |
 
 Set to a high value on a machine running processes with very large descriptor tables — a database, a proxy, a file server.
+
+### `read_smaps` — default true
+
+Collect proportional set size from `/proc/<pid>/smaps_rollup`.
+
+**This is the only correct group memory figure.** Resident set size counts each shared page once per member, so forty nginx workers sharing the same text sum to far more than they actually occupy, and the group total can exceed physical memory. PSS divides each shared page by the number of processes sharing it, so the group sum is accurate.
+
+The read walks page tables and costs about as much as the descriptor directory walk, so it runs on its own schedule. It needs the same privilege as `io`.
+
+Set false when:
+
+- Running a kernel older than 4.14, where the cheap `smaps_rollup` does not exist and the fallback `smaps` has one entry per memory mapping — hundreds for a large JVM.
+- Running unprivileged and you have accepted that only your own processes are visible.
+- The machine must be absolutely minimal and you can work with RSS trends alone.
+
+### `smaps_scan_every` — default 12
+
+Read proportional memory every Nth scan.
+
+Same reasoning as `fd_scan_every`, and the same caching behaviour between scans. At the default 5-second interval this refreshes once per minute. Memory footprint changes over minutes, not seconds, so a faster refresh buys nothing.
+
+The two expensive reads are deliberately offset onto different scans rather than stacking on the same one.
 
 ### `read_io` — default true
 
@@ -950,14 +987,18 @@ Without this, every wrapper script merges into `bash` alongside interactive shel
 
 ## 8.1 The complete tuning table
 
-| Machine | interval | batch_size | batch_sleep | fd_scan_every | Approx CPU |
+| Machine | interval | batch_size | batch_sleep | fd / smaps every | Approx CPU |
 |---|---|---|---|---|---|
-| Small, under 200 procs | 15s | 100 | 2ms | 2 | 0.1% |
-| Typical, under 1,000 | 15s | 50 | 5ms | 4 | 0.5% |
-| Busy, 1,000–5,000 | 30s | 50 | 5ms | 8 | 0.5% |
-| Very busy, over 5,000 | 60s | 100 | 10ms | 10 | 0.4% |
-| Latency-sensitive | 60s | 25 | 20ms | 20 | 0.1% |
-| High-resolution debug | 5s | 200 | 1ms | 2 | 3% |
+| Under 200 procs, high resolution | 1s | 100 | 1ms | 60 | 1.5% |
+| Under 200 procs | 5s | 100 | 2ms | 12 | 0.3% |
+| Typical, under 1,000 | 5s | 50 | 4ms | 12 | 1% |
+| Busy, 1,000–5,000 | 5s | 100 | 3ms | 24 | 2% |
+| Very busy, over 5,000 | 10s | 100 | 5ms | 30 | 2% |
+| Latency-sensitive | 15s | 25 | 15ms | 30 | 0.3% |
+
+Set `fd_scan_every` and `smaps_scan_every` to the same value. The two expensive reads are automatically offset onto different scans.
+
+The last row is the only place a 15-second interval belongs: a machine where the exporter must be nearly invisible and coarse data is acceptable.
 
 ## 8.2 What each change does
 
@@ -1008,11 +1049,27 @@ Fine at a 60s interval; an overrun at a 1s interval.
 |---|---|
 | Substantially lower CPU on some machines | Staler descriptor counts |
 
-This has the largest effect on machines running processes with big descriptor tables. On a database server holding twenty thousand descriptors, going from 1 to 8 can halve total scan cost.
+This has the largest effect on machines running processes with big descriptor tables. On a database server holding twenty thousand descriptors, going from 1 to 24 can halve total scan cost.
 
 It has almost no effect on a machine where processes hold a handful of descriptors each.
 
 Descriptor counts change slowly. Refreshing every five minutes is adequate for leak detection.
+
+### Increasing `smaps_scan_every`, or disabling `read_smaps`
+
+| Improves | Costs |
+|---|---|
+| Lower CPU, comparable to the fd saving | Staler PSS, or none at all |
+
+The page table walk is the other expensive read. On a kernel with `smaps_rollup` it is one bounded read per process; on an older kernel the fallback reads one entry per memory mapping, which for a JVM with hundreds of mappings is genuinely costly.
+
+Raise `smaps_scan_every` first. Memory footprint changes over minutes. Disable `read_smaps` entirely only if the machine has old kernels and large-mapping processes, and accept that RSS then over-counts with no correction available.
+
+Check which path you are on:
+
+```bash
+ls /proc/self/smaps_rollup    # present means the cheap path
+```
 
 ### Disabling `read_io`
 
@@ -1044,10 +1101,12 @@ rate(process_exporter_scan_cpu_seconds_total[5m])
 
 | Value | Meaning |
 |---|---|
-| Below 0.005 | Excellent |
-| 0.005–0.02 | Normal for a typical server |
-| 0.02–0.05 | High; consider tuning |
+| Below 0.01 | Excellent |
+| 0.01–0.03 | Normal at a 5-second interval |
+| 0.03–0.05 | High; consider tuning |
 | Above 0.05 | Over 5% of a core; tune now |
+
+These thresholds assume the 5-second default. At 1 second, expect roughly five times these figures.
 
 Also watch scan duration against the interval:
 
@@ -1100,8 +1159,9 @@ It becomes worth thinking about above roughly five seconds of scan duration, whi
 | `/proc/<pid>/cmdline` | None | argv |
 | `/proc/<pid>/io` | **Same UID or `CAP_SYS_PTRACE`** | I/O bytes |
 | `/proc/<pid>/fd/` | **Same UID or `CAP_SYS_PTRACE`** | Open descriptors |
+| `/proc/<pid>/smaps_rollup` | **Same UID or `CAP_SYS_PTRACE`** | Proportional set size |
 
-**CPU and memory are always complete.** The kernel exposes those files to everyone.
+**Basic CPU and memory are always complete.** The kernel exposes `stat` and `statm` to everyone. Proportional set size is not in that group — it needs the same privilege as `io`, so an unprivileged exporter gets PSS only for its own processes and reports the shortfall through `process_group_pss_coverage_ratio`.
 
 ## 9.2 Reading the coverage ratios
 
@@ -1139,9 +1199,11 @@ Note `> 0` in the condition. A ratio of exactly 0 means the exporter cannot see 
 |---|---|
 | Complete data | Run as root |
 | Complete data, minimum privilege | `AmbientCapabilities=CAP_SYS_PTRACE` |
-| CPU and memory only, no privilege | Unprivileged, `read_io: false` |
+| Basic data only, no privilege | Unprivileged, `read_io: false`, `read_smaps: false` |
 
-`CAP_SYS_PTRACE` is a genuinely powerful capability — it permits attaching to and inspecting any process. If your security posture does not allow it, running unprivileged with `read_io: false` gives complete CPU, memory, thread, and state data, which covers the majority of use cases.
+`CAP_SYS_PTRACE` is a genuinely powerful capability — it permits attaching to and inspecting any process. If your security posture does not allow it, running unprivileged gives complete CPU, RSS, thread, and state data, which covers the majority of use cases.
+
+Note what the unprivileged path loses: I/O bytes, descriptor counts, and **proportional set size**. Without PSS you have RSS only, which over-counts shared pages. That is a real limitation on any machine running a forked master-and-workers service, and it is the strongest argument for granting the capability.
 
 ---
 
@@ -1315,14 +1377,17 @@ scrape_configs:
 # Top CPU consumers
 topk(10, sum by (name, user) (rate(process_group_cpu_seconds_total[5m])))
 
-# Top memory consumers
-topk(10, process_group_memory_rss_bytes)
+# Top memory consumers — PSS is the honest figure
+topk(10, process_group_memory_pss_bytes)
 
-# Unshared memory — more honest than RSS
+# Private writable memory — a heap leak indicator, not a PSS substitute
 topk(10, process_group_memory_data_bytes)
 
-# Descriptor pressure
-process_group_open_fds / process_group_max_fds > 0.8
+# Swapped memory by group
+topk(10, process_group_memory_swap_bytes)
+
+# Descriptor pressure — the worst member, not a ratio of sums
+topk(10, process_group_worst_fd_ratio)
 
 # Process count changing — leak or crash loop
 delta(process_group_num_procs[1h]) != 0
@@ -1352,14 +1417,17 @@ sum by (name) (rate(process_group_cpu_seconds_total[5m]))
 count(count by (cpu) (node_cpu_seconds_total))
 ```
 
-Do **not** do the same with memory:
+Memory needs the right metric:
 
 ```promql
-# WRONG — RSS sums over-count shared pages and can exceed MemTotal
+# Correct — PSS sums to the true physical footprint
+sum(process_group_memory_pss_bytes) / node_memory_MemTotal_bytes
+
+# Wrong — RSS over-counts shared pages and can exceed MemTotal
 sum(process_group_memory_rss_bytes) / node_memory_MemTotal_bytes
 ```
 
-Use `process_group_memory_data_bytes` for any comparison against total memory, and treat even that as approximate.
+The PSS form should land somewhere under 1.0 and account for most of the machine's used memory. If it does not, check `process_group_pss_coverage_ratio` — an unprivileged exporter sees PSS only for its own processes.
 
 ## 11.4 Alerting rules
 
@@ -1367,12 +1435,21 @@ Use `process_group_memory_data_bytes` for any comparison against total memory, a
 groups:
   - name: process_groups
     rules:
+      # The worst individual ratio, not a ratio of the group sums. Ten
+      # processes at a 4096 limit, one holding 4000 and nine holding 40,
+      # gives a sum ratio of 0.11 while one process is 96 descriptors
+      # from failing. The sum form cannot raise this alert.
       - alert: ProcessGroupFDExhaustion
-        expr: process_group_open_fds / process_group_max_fds > 0.9
+        expr: process_group_worst_fd_ratio > 0.9
         for: 5m
         labels: { severity: critical }
         annotations:
-          summary: "{{ $labels.name }} ({{ $labels.user }}) near its fd limit"
+          summary: "a process in {{ $labels.name }} ({{ $labels.user }}) is at {{ $value }} of its fd limit"
+
+      - alert: ProcessGroupFDWarning
+        expr: process_group_worst_fd_ratio > 0.8
+        for: 15m
+        labels: { severity: warning }
 
       - alert: ProcessGroupGone
         expr: process_group_num_procs == 0
@@ -1393,11 +1470,17 @@ groups:
 
       - alert: ProcessGroupMemoryGrowth
         expr: |
-          delta(process_group_memory_data_bytes[6h])
-            / process_group_memory_data_bytes > 0.5
+          delta(process_group_memory_pss_bytes[6h])
+            / process_group_memory_pss_bytes > 0.5
         for: 30m
         annotations:
-          summary: "{{ $labels.name }} private memory grew 50% in 6h"
+          summary: "{{ $labels.name }} footprint grew 50% in 6h"
+
+      - alert: ProcessGroupSwapping
+        expr: process_group_memory_swap_bytes > 1073741824
+        for: 15m
+        annotations:
+          summary: "{{ $labels.name }} has over 1GB swapped"
 
   - name: process_exporter_health
     rules:
@@ -1447,7 +1530,7 @@ groups:
 
       - record: instance:process_group_memory:sum
         expr: sum by (instance, name, user) (
-                process_group_memory_data_bytes)
+                process_group_memory_pss_bytes)
 ```
 
 ---
@@ -1567,17 +1650,27 @@ Common causes:
 - Its owner is in `ignore_users`.
 - It is short-lived and exits between scans.
 
-## 13.3 I/O or descriptor metrics are absent
+## 13.3 I/O, descriptor, or PSS metrics are absent
 
 ```bash
 curl -s localhost:9256/metrics | grep coverage_ratio
 ```
 
-A ratio of 0 means nothing was readable — you are unprivileged and do not own those processes.
+Three ratios are published: `io_coverage_ratio`, `fd_coverage_ratio`, and `pss_coverage_ratio`.
 
-Fix by running as root, or by granting `CAP_SYS_PTRACE`, or by accepting the limitation and setting `read_io: false` to avoid the futile attempt.
+A ratio of 0 means nothing was readable — you are unprivileged and do not own those processes. All three files need a matching UID or `CAP_SYS_PTRACE`.
 
-If descriptor metrics are absent but the coverage ratio is 1, `fd_scan_every` has not yet come round. Wait `interval × fd_scan_every`.
+Fix by running as root, or by granting `CAP_SYS_PTRACE`, or by accepting the limitation and setting `read_io: false` and `read_smaps: false` to avoid the futile attempts.
+
+If the metrics are absent but the coverage ratio is 1, the periodic read has not yet come round. Wait `interval × fd_scan_every` or `interval × smaps_scan_every` respectively — sixty seconds at the defaults.
+
+For PSS specifically, also confirm which read path is in use:
+
+```bash
+ls /proc/self/smaps_rollup
+```
+
+Absent means the kernel predates 4.14 and the fallback reads `smaps`, which is materially more expensive on processes with many mappings.
 
 ## 13.4 Group count growing steadily
 
@@ -1603,11 +1696,12 @@ rate(process_exporter_scan_cpu_seconds_total[5m])
 
 In order of effectiveness:
 
-1. Double `scan.interval`. Halves the cost.
-2. Raise `fd_scan_every`. Large effect if descriptor tables are big.
+1. Raise `fd_scan_every` and `smaps_scan_every`. These are the two expensive reads and both refresh data that changes slowly.
+2. Double `scan.interval`. Halves the cost, at the price of resolution — but do not go past 5s without accepting that short events become invisible.
 3. Raise `batch_sleep`. Direct but risks overruns.
-4. Broaden the ignore list. Each ignored process costs one read instead of five.
+4. Broaden the ignore list. Each ignored process costs one read instead of six.
 5. Set `read_io: false` if you are not using the data.
+6. Set `read_smaps: false` as a last resort, accepting that RSS then over-counts with no correction.
 
 ## 13.6 Scans are overrunning
 
@@ -1635,7 +1729,25 @@ Should stay below `scan.interval × 2`. Higher means scans are failing or hangin
 
 Expected. RSS is summed per member and shared pages are counted once per member.
 
-Use `process_group_memory_data_bytes` for anything compared against total memory. See §3.4.
+Use `process_group_memory_pss_bytes` for anything compared against total memory. See §3.4.
+
+If PSS is also absent, `read_smaps` is off or the exporter lacks the privilege. Check `process_group_pss_coverage_ratio`.
+
+## 13.11 The FD alert never fires
+
+If you are still alerting on this:
+
+```promql
+process_group_open_fds / process_group_max_fds > 0.9
+```
+
+it will not fire on the case it exists for. Both operands are group sums, and a single member at its limit is diluted by every other member of the group. Switch to:
+
+```promql
+process_group_worst_fd_ratio > 0.9
+```
+
+See §3.2 for the worked example.
 
 ## 13.9 Names are truncated
 

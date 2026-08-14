@@ -24,6 +24,11 @@ type System struct {
 	PageSize   int64
 	BootTime   float64
 	ProcPath   string
+
+	// SmapsRollup reports whether the cheap single-read form is
+	// available. Detected once at start, because probing per process
+	// would cost one stat per process per scan.
+	SmapsRollup bool
 }
 
 // NewSystem reads the system constants. It fails only when /proc is
@@ -37,10 +42,11 @@ func NewSystem(procPath string) (*System, error) {
 		return nil, fmt.Errorf("procfs: read boot time: %w", err)
 	}
 	return &System{
-		ClockTicks: clockTicks(),
-		PageSize:   int64(os.Getpagesize()),
-		BootTime:   bt,
-		ProcPath:   procPath,
+		ClockTicks:  clockTicks(),
+		PageSize:    int64(os.Getpagesize()),
+		BootTime:    bt,
+		ProcPath:    procPath,
+		SmapsRollup: HaveSmapsRollup(procPath),
 	}, nil
 }
 
@@ -172,4 +178,3 @@ func (c *UserCache) Refresh() {
 	c.loadedAt = time.Now()
 	c.mu.Unlock()
 }
-

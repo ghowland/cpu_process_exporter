@@ -51,11 +51,25 @@ type Sample struct {
 	VSizeBytes  uint64         `json:"vsize_bytes"`
 	SharedBytes uint64         `json:"shared_bytes"`
 	DataBytes   uint64         `json:"data_bytes"`
+	SwapBytes   uint64         `json:"swap_bytes"`
 	OpenFDs     int            `json:"open_fds"`
 	MaxFDs      int            `json:"max_fds"`
 	OldestStart float64        `json:"oldest_start"`
 	States      map[byte]int   `json:"-"`
 	StateNames  map[string]int `json:"states"`
+
+	// WorstFDRatio is the maximum of the per-process ratios, not a
+	// ratio of the group sums. A group of forty workers where one is
+	// at its limit dilutes a sum ratio by a factor of forty, so the
+	// sum form cannot raise an alert on the case it exists for.
+	WorstFDRatio float64 `json:"worst_fd_ratio"`
+
+	// Proportional set size. Summed across the group this is the true
+	// physical footprint, because each shared page is divided by the
+	// number of processes sharing it. RSSBytes counts each shared page
+	// once per member and therefore over-counts.
+	PSSBytes     uint64 `json:"pss_bytes"`
+	SwapPSSBytes uint64 `json:"swap_pss_bytes"`
 
 	Accum Accum `json:"accum"`
 
@@ -64,6 +78,7 @@ type Sample struct {
 	// "this group does no I/O" from "I cannot see this group's I/O".
 	FDsRead int `json:"fds_read"`
 	IORead  int `json:"io_read"`
+	PSSRead int `json:"pss_read"`
 }
 
 // FDCoverage returns the fraction of members whose descriptor count was
@@ -81,6 +96,18 @@ func (s *Sample) IOCoverage() float64 {
 		return 0
 	}
 	return float64(s.IORead) / float64(s.NumProcs)
+}
+
+// PSSCoverage returns the fraction of members whose smaps was readable.
+//
+// smaps needs the same privilege as io, so an unprivileged exporter
+// gets proportional memory only for its own processes. Below one, the
+// PSS total is a lower bound.
+func (s *Sample) PSSCoverage() float64 {
+	if s.NumProcs == 0 {
+		return 0
+	}
+	return float64(s.PSSRead) / float64(s.NumProcs)
 }
 
 // Snapshot is one complete scan result, published atomically.
@@ -172,7 +199,14 @@ func (a *Aggregator) Apply(res *scan.Result, retention time.Duration) *Snapshot 
 		s.VSizeBytes += p.VSizeBytes
 		s.SharedBytes += p.SharedBytes
 		s.DataBytes += p.DataBytes
+		s.SwapBytes += p.SwapBytes
 		s.States[p.State]++
+
+		if p.HavePSS {
+			s.PSSBytes += p.PSSBytes
+			s.SwapPSSBytes += p.SwapPSSBytes
+			s.PSSRead++
+		}
 
 		// The oldest member gives the group age, which is what changes
 		// when a service restarts.
@@ -183,13 +217,16 @@ func (a *Aggregator) Apply(res *scan.Result, retention time.Duration) *Snapshot 
 		if p.HaveFDs && p.OpenFDs >= 0 {
 			s.OpenFDs += p.OpenFDs
 			s.FDsRead++
-			// The limit is summed alongside the count so that the ratio
-			// open/max is meaningful for the group as a whole. A limit
-			// of unlimited reads as -1 and is excluded from the sum.
 			if p.MaxFDs > 0 {
 				s.MaxFDs += p.MaxFDs
 			}
+			// The maximum, not a ratio of the sums. This is what makes
+			// a single member near its limit visible in a large group.
+			if p.FDRatio > s.WorstFDRatio {
+				s.WorstFDRatio = p.FDRatio
+			}
 		}
+
 		if p.HaveIO {
 			s.IORead++
 		}
@@ -321,4 +358,3 @@ func stateName(s byte) string {
 		return "unknown"
 	}
 }
-

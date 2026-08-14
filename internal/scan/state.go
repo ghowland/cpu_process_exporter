@@ -34,10 +34,22 @@ type PIDState struct {
 
 	// Cached descriptor values, refreshed only on an fd scan. Between
 	// fd scans the previous values are reported, so the gauge does not
-	// drop to zero on the three scans out of four that skip the walk.
+	// drop to zero on the scans that skip the walk.
+	//
+	// FDRatio is computed per process before aggregation. A ratio of
+	// group sums cannot detect one member near its limit: ten
+	// processes at a 4096 limit, one holding 4000 and nine holding 40,
+	// gives a sum ratio of 0.11 while the worst member is at 0.98.
 	OpenFDs int
 	MaxFDs  int
+	FDRatio float64
 	HaveFDs bool
+
+	// Cached proportional memory, refreshed only on a smaps scan, for
+	// the same reason as the descriptor values above.
+	PSSBytes     uint64
+	SwapPSSBytes uint64
+	HavePSS      bool
 }
 
 // StateMap holds the per-PID state. It is owned by the scanner and is
@@ -135,4 +147,3 @@ func Delta(now, prev uint64) uint64 {
 	}
 	return now - prev
 }
-

@@ -16,6 +16,10 @@ type Status struct {
 	GID        uint32
 	VolCtxSw   uint64
 	InvolCtxSw uint64
+
+	// SwapBytes comes from VmSwap. It costs nothing extra, because
+	// this file is already open and parsed.
+	SwapBytes uint64
 }
 
 // ReadStatus parses /proc/<pid>/status.
@@ -73,14 +77,22 @@ func ReadStatus(procPath string, pid int) (*Status, error) {
 				st.InvolCtxSw = v
 				found++
 			}
+		case "VmSwap":
+			// Reported in kilobytes with a kB suffix.
+			if fields := strings.Fields(val); len(fields) > 0 {
+				if v, err := strconv.ParseUint(fields[0], 10, 64); err == nil {
+					st.SwapBytes = v * 1024
+					found++
+				}
+			}
 		}
-		if found == 4 {
+		if found == 5 {
 			break
 		}
+
 	}
 	if err := sc.Err(); err != nil {
 		return nil, err
 	}
 	return st, nil
 }
-
