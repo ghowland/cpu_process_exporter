@@ -1,4 +1,4 @@
-# Process Exporter
+# CPU Process Exporter
 
 A Prometheus exporter that reads `/proc` on an interval, groups every running process by **name and owning user**, and publishes the group totals. No PID appears in any label.
 
